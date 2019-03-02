@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ExchangeData serialNo="s018d04eb51-d31b-427f-8c8c-b443502f2ae9">
+	<CompanyTask>
+		<CompanyInfo>
+			<CACompanyName></CACompanyName>
+			<CompanyCode>535142863034601472</CompanyCode>
+			<CompanyName>邯郸市泽天紧固件有限公司</CompanyName>
+			<ManageCode></ManageCode>
+			<ProvinceCode>130408</ProvinceCode>
+			<ProvinceName></ProvinceName>
+			<RunTaskClient>HDLH-PC3</RunTaskClient>
+			<Tyshxydm></Tyshxydm>
+			<Xzqhid>13</Xzqhid>
+			<gssbwz>1</gssbwz>
+			<nsrsbh>91130408MA08AHBT2E</nsrsbh>
+		</CompanyInfo>
+		<DeclareState>
+			<TaskGroup id="附加税（费）申报">1</TaskGroup>
+			<TaskGroup id="增值税一般纳税人申报">1</TaskGroup>
+		</DeclareState>
+		<TaskList id="HBGDS" type="GS">
+			<BaseInfo>
+				<VpnName></VpnName>
+				<VpnPassword></VpnPassword>
+				<LoginType>Password</LoginType>
+				<LoginType>Password</LoginType>
+				<GrsdsSbPassword>a123456</GrsdsSbPassword>
+				<LoginName>130429199305181055</LoginName>
+				<LoginPassword>zt6932888</LoginPassword>
+			</BaseInfo>
+			<TaskGroup id="HB_BASE_INFO" taskId="515174430071205888" type="CJ">
+				<GroupResult>
+					<ResultCode></ResultCode>
+					<ResultDesc></ResultDesc>
+				</GroupResult>
+				<TaskItem id="HB_BASE_INFO">
+					<TaskResult>
+						<ResultCode></ResultCode>
+						<ResultDesc></ResultDesc>
+					</TaskResult>
+					<TaskParam>
+						<nsrmc></nsrmc>
+						<nsrsbh></nsrsbh>
+						<djzclx></djzclx>
+						<zcdz></zcdz>
+						<jyfw></jyfw>
+						<scjydz></scjydz>
+						<ZGSWJG></ZGSWJG>
+						<zczb></zczb>
+						<fddbr></fddbr>
+						<fddbr_mobile></fddbr_mobile>
+						<fd_sfzjmc></fd_sfzjmc>
+						<fd_zjhm></fd_zjhm>
+						<cwfzr></cwfzr>
+						<cwfzr_mobile></cwfzr_mobile>
+						<cwfzrzjlx></cwfzrzjlx>
+						<cwfzrzjhm></cwfzrzjhm>
+						<bslxr></bslxr>
+						<bslxr_mobile></bslxr_mobile>
+						<bsrysfzlx></bsrysfzlx>
+						<bsrysfzhm></bsrysfzhm>
+						<swdjrq></swdjrq>
+						<gbhy></gbhy>
+						<gbbm></gbbm>
+					</TaskParam>
+				</TaskItem>
+			</TaskGroup>
+			<TaskGroup id="HBGS_SZRD" taskId="515174430197051392" type="CJ" ssqs="2018-11-22 14:39:17">
+				<GroupResult>
+					<ResultCode></ResultCode>
+					<ResultDesc></ResultDesc>
+				</GroupResult>
+				<TaskItem id="HBGS_SZRD">
+					<TaskResult>
+						<ResultCode></ResultCode>
+						<ResultDesc></ResultDesc>
+					</TaskResult>
+					<TaskParam>
+						<Item type="GS_JDXX">
+							<zsxm></zsxm>
+							<zspm></zspm>
+							<nsqx></nsqx>
+							<rdyxqq></rdyxqq>
+							<rdyxqz></rdyxqz>
+						</Item>
+						<Item type="GS_CWBB">
+							<cwzd></cwzd>
+							<ssqq></ssqq>
+							<ssqz></ssqz>
+						</Item>
+						<Item type="GS_QYSDS">
+							<sbbmc></sbbmc>
+						</Item>
+					</TaskParam>
+				</TaskItem>
+			</TaskGroup>
+		</TaskList>
+	</CompanyTask>
+</ExchangeData>

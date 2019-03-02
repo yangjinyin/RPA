@@ -1,0 +1,13 @@
+Python 3.7
+Chrome 
+ChromeDriver 2.41.578737 (49da6702b16031c40d63e5618de03a32ff6c197e)
+
+pip install xmltodict
+pip install selenium
+pip install Pillow
+pip install beautifulsoup4
+pip install lxml
+pip install selenium-requests
+pip install pyinstaller
+pip install python-dateutil
+
