@@ -1,0 +1,648 @@
+From b329e8b5abf715eb4629e1b1d8dc317b6ed5d2c3 Mon Sep 17 00:00:00 2001
+From: nongtianzhen <nongtianzhen@baidu.com>
+Date: Tue, 11 Nov 2025 20:21:23 +0800
+Subject: [PATCH] =?UTF-8?q?[database-gaiadb-7033]=20join=20=E4=BC=98?=
+ =?UTF-8?q?=E5=8C=96=E5=99=A8full=20outer=20join?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Change-Id: I54e3b71e9a00502d9d6d562ffba3e21540cfc045
+---
+ sql/iterators/hash_join_buffer.h    |  13 ++-
+ sql/iterators/hash_join_iterator.cc | 139 ++++++++++++++++++++++++++--
+ sql/iterators/hash_join_iterator.h  |  11 +++
+ sql/join_optimizer/access_path.cc   |   3 +
+ sql/lex.h                           |   1 +
+ sql/parse_tree_nodes.cc             |   4 +-
+ sql/parse_tree_nodes.h              |   4 +-
+ sql/parser_yystype.h                |   1 +
+ sql/psi_memory_key.cc               |   3 +
+ sql/psi_memory_key.h                |   1 +
+ sql/sql_executor.cc                 |  22 +++--
+ sql/sql_opt_exec_shared.h           |   6 ++
+ sql/sql_optimizer.cc                |   3 +
+ sql/sql_yacc.yy                     |  13 ++-
+ sql/table.h                         |   1 +
+ 15 files changed, 201 insertions(+), 24 deletions(-)
+
+diff --git a/sql/iterators/hash_join_buffer.h b/sql/iterators/hash_join_buffer.h
+index b311b3dc659..2f175f1d0df 100644
+--- a/sql/iterators/hash_join_buffer.h
++++ b/sql/iterators/hash_join_buffer.h
+@@ -158,6 +158,14 @@ void LoadImmutableStringIntoTableBuffers(
+ 
+ enum class StoreRowResult { ROW_STORED, BUFFER_FULL, FATAL_ERROR };
+ 
++using hash_map_type = robin_hood::unordered_flat_map<
++      ImmutableStringWithLength, LinkedImmutableString, KeyHasher, KeyEquals>;
++
++using hash_map_iterator = hash_map_type::const_iterator;
++
++using hash_set_type = robin_hood::unordered_flat_set<
++      ImmutableStringWithLength, KeyHasher, KeyEquals>;
++
+ class HashJoinRowBuffer {
+  public:
+   // Construct the buffer. Note that Init() must be called before the buffer can
+@@ -195,11 +203,6 @@ class HashJoinRowBuffer {
+ 
+   bool inited() const { return m_hash_map != nullptr; }
+ 
+-  using hash_map_type = robin_hood::unordered_flat_map<
+-      ImmutableStringWithLength, LinkedImmutableString, KeyHasher, KeyEquals>;
+-
+-  using hash_map_iterator = hash_map_type::const_iterator;
+-
+   hash_map_iterator find(const Key &key) const { return m_hash_map->find(key); }
+ 
+   hash_map_iterator begin() const { return m_hash_map->begin(); }
+diff --git a/sql/iterators/hash_join_iterator.cc b/sql/iterators/hash_join_iterator.cc
+index af952a92f4e..23d89f4a869 100644
+--- a/sql/iterators/hash_join_iterator.cc
++++ b/sql/iterators/hash_join_iterator.cc
+@@ -176,6 +176,13 @@ bool HashJoinIterator::Init() {
+     }
+   }
+ 
++  if (m_join_type == JoinType::FULL_OUTER) {
++    m_mem_root_full_outer = {key_memory_hash_join_full_outer, 16384 /* 16KB*/};
++    m_visited_hash_table_elements.reset(new hash_join_buffer::hash_set_type(
++      /*bucket_count=*/10, hash_join_buffer::KeyHasher()));
++    assert(m_visited_hash_table_elements != nullptr);
++  }
++
+   // Prepare to read the build input into the hash map.
+   PrepareForRequestRowId(m_build_input_tables.tables(),
+                          m_tables_to_get_rowid_for);
+@@ -444,7 +451,7 @@ bool HashJoinIterator::BuildHashTable() {
+   }
+ 
+   const bool reject_duplicate_keys = RejectDuplicateKeys();
+-  const bool store_rows_with_null_in_join_key = m_join_type == JoinType::OUTER;
++  const bool store_rows_with_null_in_join_key = m_join_type == JoinType::OUTER || m_join_type == JoinType::FULL_OUTER;
+ 
+   // If Init() is called multiple times (e.g., if hash join is inside an
+   // dependent subquery), we must clear the NULL row flag, as it may have been
+@@ -466,7 +473,7 @@ bool HashJoinIterator::BuildHashTable() {
+       // will also be empty. However, if the build input was empty, the output
+       // of antijoins will be all the rows from the probe input.
+       if (m_row_buffer.empty() && m_join_type != JoinType::ANTI &&
+-          m_join_type != JoinType::OUTER) {
++          m_join_type != JoinType::OUTER && m_join_type != JoinType::FULL_OUTER) {
+         m_state = State::END_OF_ROWS;
+         return false;
+       }
+@@ -511,7 +518,7 @@ bool HashJoinIterator::BuildHashTable() {
+         if (InitializeChunkFiles(
+                 m_estimated_build_rows, m_row_buffer.size(), kMaxChunks,
+                 m_probe_input_tables, m_build_input_tables,
+-                /*include_match_flag_for_probe=*/m_join_type == JoinType::OUTER,
++                /*include_match_flag_for_probe=*/(m_join_type == JoinType::OUTER || m_join_type == JoinType::FULL_OUTER),
+                 &m_chunk_files_on_disk)) {
+           assert(thd_g()->is_error());  // my_error should have been called.
+           return true;
+@@ -594,6 +601,14 @@ bool HashJoinIterator::ReadNextHashJoinChunk() {
+   }
+ 
+   if (m_current_chunk == static_cast<int>(m_chunk_files_on_disk.size())) {
++    if (m_join_type == JoinType::FULL_OUTER) {
++      m_state = State::READING_ROW_FROM_PROBE_ITERATOR_FINNISHED;
++      m_probe_input->SetNullRowFlag(true);
++      m_current_iterator = m_row_buffer.begin();
++      // Reset the m_current_row to null, as we will read rows from the m_current_iterator next.
++      m_current_row = LinkedImmutableString{nullptr};
++      return false;
++    }
+     // We have moved past the last chunk, so we are done.
+     m_state = State::END_OF_ROWS;
+     return false;
+@@ -607,7 +622,7 @@ bool HashJoinIterator::ReadNextHashJoinChunk() {
+       m_chunk_files_on_disk[m_current_chunk].build_chunk;
+ 
+   const bool reject_duplicate_keys = RejectDuplicateKeys();
+-  const bool store_rows_with_null_in_join_key = m_join_type == JoinType::OUTER;
++  const bool store_rows_with_null_in_join_key = (m_join_type == JoinType::OUTER || m_join_type == JoinType::FULL_OUTER);
+   for (; m_build_chunk_current_row < build_chunk.num_rows();
+        ++m_build_chunk_current_row) {
+     // Read the next row from the chunk file, and put it in the in-memory row
+@@ -751,6 +766,68 @@ bool HashJoinIterator::ReadRowFromProbeIterator() {
+   }
+ }
+ 
++int HashJoinIterator::ReadNextHashJoinNotMatchedRowsForFullOuterJoin() {
++  if (m_join_type != JoinType::FULL_OUTER) {
++    return 1;
++  }
++  
++  if (m_current_iterator == m_row_buffer.end()) {
++    m_mem_root_full_outer.Clear();
++    m_state = State::END_OF_ROWS;
++    return -1;
++  }
++  
++  if (m_visited_hash_table_elements->find(m_current_iterator->first) !=
++    m_visited_hash_table_elements->end()) {
++    // The row has already been visited when ReadNextJoinedRowFromHashTable, so skip it.
++    m_current_iterator++;
++    return -1;
++  }
++
++  if (m_current_row == nullptr) {
++    m_current_row = m_current_iterator->second;
++    assert(m_current_row != nullptr);
++  }
++
++  int res = 0;
++  bool passes_extra_conditions = false;
++  for (;;) {
++    if (thd_g()->is_error() || thd_g()->killed || thd_g()->m_execute_canceled) {
++      // Evaluation of extra conditions raised an error, so abort the join.
++      return 1;
++    }
++
++    // A row buffer contains all rows that have the same join key values,
++    // so we need to iterate over all rows in the buffer to find every row that
++    // passes extra conditions.
++    res = ReadJoinedRow();
++    if (res != 0) {
++      // It must be something wrong that we cannot read a joined row.
++      return 1;
++    }
++
++    passes_extra_conditions = JoinedRowPassesExtraConditions();
++    m_current_row = m_current_row.Decode().next;
++    if (m_current_row == nullptr) {
++      // No more rows in the current row buffer, read the next row buffer.
++      m_current_iterator++;
++    }
++
++    if (passes_extra_conditions) {
++      // We found a matched row, then send to the client.
++      return 0;
++    } else {
++      // The row did not pass extra conditions, and then read another row.
++      if (m_current_row == nullptr) {
++        // No more rows in the current row buffer.
++        return -1;
++      }
++    }
++  }
++
++  return 1;
++}
++
+ bool HashJoinIterator::ReadRowFromProbeChunkFile() {
+   assert(on_disk_hash_join() && m_current_chunk != -1);
+ 
+@@ -869,7 +946,7 @@ void HashJoinIterator::LookupProbeRowInHashTable() {
+       &m_temporary_row_and_join_key_buffer);
+ 
+   if (null_in_join_key) {
+-    if (m_join_type == JoinType::ANTI || m_join_type == JoinType::OUTER) {
++    if (m_join_type == JoinType::ANTI || m_join_type == JoinType::OUTER || m_join_type == JoinType::FULL_OUTER) {
+       // SQL NULL was found, and we will never find a matching row in the hash
+       // table. Let us indicate that, so that a null-complemented row is
+       // returned.
+@@ -889,6 +966,34 @@ void HashJoinIterator::LookupProbeRowInHashTable() {
+     m_current_row = LinkedImmutableString{nullptr};
+   } else {
+     m_current_row = it->second;
++    if (m_join_type == JoinType::FULL_OUTER) {
++      // We have found the matched row in the hash table, and then save the key to m_visited_hash_table_elements
++      assert(m_mem_root_full_outer != nullptr);
++      const size_t required_key_bytes =
++          ImmutableStringWithLength::RequiredBytesForEncode(m_temporary_row_and_join_key_buffer.length());
++      ImmutableStringWithLength fullOuterKey;
++
++      std::pair<char *, char *> block = m_mem_root_full_outer.Peek();
++      size_t bytes_to_commit = 0;
++      if (static_cast<size_t>(block.second - block.first) < required_key_bytes) {
++        // No room in this block, so ask for a new one and try again.
++        m_mem_root_full_outer.ForceNewBlock(required_key_bytes);
++        block = m_mem_root_full_outer.Peek();
++      }
++      char *ptr = block.first;
++      fullOuterKey = ImmutableStringWithLength::Encode(m_temporary_row_and_join_key_buffer.ptr(),
++                                                       m_temporary_row_and_join_key_buffer.length(),
++                                                       &ptr);
++      assert(ptr < block.second);
++      bytes_to_commit = ptr - block.first;
++      
++      std::pair<hash_join_buffer::hash_set_type::iterator, bool> key_it_and_inserted = 
++        m_visited_hash_table_elements->emplace(fullOuterKey);
++      if (key_it_and_inserted.second) {
++        // We need to keep this key and step to next address for next key
++        m_mem_root_full_outer.RawCommit(bytes_to_commit);
++      }
++    }
+   }
+ 
+   m_state = State::READING_FIRST_ROW_FROM_HASH_TABLE;
+@@ -915,11 +1020,11 @@ bool HashJoinIterator::WriteProbeRowToDiskIfApplicable() {
+   // need to write it out to disk. Outer joins should always write the row out
+   // to disk, since the probe/left input should return NULL-complemented rows
+   // even if the join condition contains SQL NULL.
+-  const bool write_rows_with_null_in_join_key = m_join_type == JoinType::OUTER;
++  const bool write_rows_with_null_in_join_key = (m_join_type == JoinType::OUTER || m_join_type == JoinType::FULL_OUTER);
+   if (m_state == State::READING_FIRST_ROW_FROM_HASH_TABLE) {
+     const bool found_match = m_current_row != nullptr;
+ 
+-    if ((m_join_type == JoinType::INNER || m_join_type == JoinType::OUTER) ||
++    if ((m_join_type == JoinType::INNER || m_join_type == JoinType::OUTER || m_join_type == JoinType::FULL_OUTER) ||
+         !found_match) {
+       if (on_disk_hash_join() && m_current_chunk == -1) {
+         if (WriteRowToChunk(thd_g(), &m_chunk_files_on_disk,
+@@ -1013,7 +1118,7 @@ int HashJoinIterator::ReadNextJoinedRowFromHashTable() {
+       return_null_complemented_row = false;
+     } else if (m_join_type == JoinType::ANTI) {
+       return_null_complemented_row = true;
+-    } else if (m_join_type == JoinType::OUTER &&
++    } else if ((m_join_type == JoinType::OUTER || m_join_type == JoinType::FULL_OUTER) &&
+                m_state == State::READING_FIRST_ROW_FROM_HASH_TABLE &&
+                !m_probe_row_match_flag) {
+       return_null_complemented_row = true;
+@@ -1042,11 +1147,12 @@ int HashJoinIterator::ReadNextJoinedRowFromHashTable() {
+       return -1;  // Read the next row.
+     case JoinType::OUTER:
+     case JoinType::INNER:
++    case JoinType::FULL_OUTER:
+       // Inner join should return all matching rows from the hash table before
+       // moving to the next row from the probe input.
+       m_state = State::READING_FROM_HASH_TABLE;
+       break;
+-    case JoinType::FULL_OUTER:
++    default:
+       assert(false);
+   }
+ 
+@@ -1103,6 +1209,19 @@ int HashJoinIterator::Read() {
+         assert(res == 1);
+         return res;
+       }
++      case State::READING_ROW_FROM_PROBE_ITERATOR_FINNISHED: {
++        int res = ReadNextHashJoinNotMatchedRowsForFullOuterJoin();
++        if (res == 0) {
++          // Read a row from the hash table, and send it to the client.
++          return 0;
++        }
++
++        if (res == -1) {
++          continue;
++        }
++        
++        return res;
++      }
+       case State::END_OF_ROWS:
+         return -1;
+     }
+@@ -1116,7 +1235,7 @@ int HashJoinIterator::Read() {
+ bool HashJoinIterator::InitWritingToProbeRowSavingFile() {
+   m_write_to_probe_row_saving = true;
+   return m_probe_row_saving_write_file.Init(m_probe_input_tables,
+-                                            m_join_type == JoinType::OUTER);
++                                           (m_join_type == JoinType::OUTER || m_join_type == JoinType::FULL_OUTER));
+ }
+ 
+ bool HashJoinIterator::InitReadingFromProbeRowSavingFile() {
+diff --git a/sql/iterators/hash_join_iterator.h b/sql/iterators/hash_join_iterator.h
+index 5f0e07d5f92..a2ea311e44c 100644
+--- a/sql/iterators/hash_join_iterator.h
++++ b/sql/iterators/hash_join_iterator.h
+@@ -475,6 +475,8 @@ class HashJoinIterator final : public RowIterator {
+   /// @retval 1 An error occurred.
+   int ReadNextJoinedRowFromHashTable();
+ 
++  int ReadNextHashJoinNotMatchedRowsForFullOuterJoin();
++
+   enum class State {
+     // We are reading a row from the probe input, where the row comes from
+     // the iterator.
+@@ -493,6 +495,8 @@ class HashJoinIterator final : public RowIterator {
+     READING_FIRST_ROW_FROM_HASH_TABLE,
+     // We are reading the remaining rows returned from the hash table lookup.
+     READING_FROM_HASH_TABLE,
++    // Just for full outer join
++    READING_ROW_FROM_PROBE_ITERATOR_FINNISHED,
+     // No more rows, both inputs are empty.
+     END_OF_ROWS
+   };
+@@ -523,6 +527,13 @@ class HashJoinIterator final : public RowIterator {
+   // details on how and when this is used.
+   hash_join_buffer::HashJoinRowBuffer m_row_buffer;
+ 
++  // An iterator over the rows in the hash table. This is used to full outer join
++  hash_join_buffer::hash_map_iterator m_current_iterator;
++  // A set of visited hash table elements, used to avoid duplicate rows in full outer join
++  std::unique_ptr<hash_join_buffer::hash_set_type> m_visited_hash_table_elements{nullptr};
++  // Memory root for m_visited_hash_table_elements
++  MEM_ROOT m_mem_root_full_outer;
++  
+   // A list of the join conditions (all of them are equi-join conditions).
+   Prealloced_array<HashJoinCondition, 4> m_join_conditions;
+ 
+diff --git a/sql/join_optimizer/access_path.cc b/sql/join_optimizer/access_path.cc
+index a6708764643..3d393ee75dd 100644
+--- a/sql/join_optimizer/access_path.cc
++++ b/sql/join_optimizer/access_path.cc
+@@ -748,6 +748,9 @@ unique_ptr_destroy_only<RowIterator> CreateIteratorFromAccessPath(
+           case RelationalExpression::LEFT_JOIN:
+             join_type = JoinType::OUTER;
+             break;
++          case RelationalExpression::FULL_OUTER_JOIN:
++            join_type = JoinType::FULL_OUTER;
++            break;
+           case RelationalExpression::ANTIJOIN:
+             join_type = JoinType::ANTI;
+             break;
+diff --git a/sql/lex.h b/sql/lex.h
+index d7387c4b1d8..587d3a19673 100644
+--- a/sql/lex.h
++++ b/sql/lex.h
+@@ -279,6 +279,7 @@ static const SYMBOL symbols[] = {
+     {SYM("FOUND", FOUND_SYM)},
+     {SYM("FROM", FROM)},
+     {SYM("FULL", FULL)},
++    {SYM("FULL_OUTER", FULL_OUTER_SYM)},
+     {SYM("FULLTEXT", FULLTEXT_SYM)},
+     {SYM("FUNCTION", FUNCTION_SYM)},
+     {SYM("GENERAL", GENERAL)},
+diff --git a/sql/parse_tree_nodes.cc b/sql/parse_tree_nodes.cc
+index 3c24cd5ac23..b252c03d740 100644
+--- a/sql/parse_tree_nodes.cc
++++ b/sql/parse_tree_nodes.cc
+@@ -168,7 +168,7 @@ bool PT_joined_table::contextualize_tabs(Parse_context *pc) {
+     return true;
+   }
+ 
+-  if (m_type & JTT_LEFT) {
++  if ((m_type & JTT_LEFT) || (m_type & JTT_FULL_OUTER)) {
+     tr2->outer_join = true;
+     if (was_right) {
+       tr2->join_order_swapped = true;
+@@ -3662,6 +3662,8 @@ bool PT_joined_table::contextualize(Parse_context *pc) {
+ 
+   if (m_type & JTT_STRAIGHT) tr2->straight = true;
+ 
++  if (m_type & JTT_FULL_OUTER) tr2->full_outer_join = true;
++
+   return false;
+ }
+ 
+diff --git a/sql/parse_tree_nodes.h b/sql/parse_tree_nodes.h
+index 76addebbe89..d1949ea5e41 100644
+--- a/sql/parse_tree_nodes.h
++++ b/sql/parse_tree_nodes.h
+@@ -542,10 +542,12 @@ class PT_joined_table : public PT_table_reference {
+     static_assert(is_single_bit(JTT_NATURAL), "not a single bit");
+     static_assert(is_single_bit(JTT_LEFT), "not a single bit");
+     static_assert(is_single_bit(JTT_RIGHT), "not a single bit");
++    static_assert(is_single_bit(JTT_FULL_OUTER), "not a single bit");
+ 
+     assert(type == JTT_INNER || type == JTT_STRAIGHT_INNER ||
+            type == JTT_NATURAL_INNER || type == JTT_NATURAL_LEFT ||
+-           type == JTT_NATURAL_RIGHT || type == JTT_LEFT || type == JTT_RIGHT);
++           type == JTT_NATURAL_RIGHT || type == JTT_LEFT || type == JTT_RIGHT ||
++           type == JTT_FULL_OUTER);
+   }
+ 
+   /**
+diff --git a/sql/parser_yystype.h b/sql/parser_yystype.h
+index 67d08b74bcf..d84413244bf 100644
+--- a/sql/parser_yystype.h
++++ b/sql/parser_yystype.h
+@@ -227,6 +227,7 @@ enum PT_joined_table_type {
+   JTT_NATURAL = 0x04,
+   JTT_LEFT = 0x08,
+   JTT_RIGHT = 0x10,
++  JTT_FULL_OUTER = 0x40,
+ 
+   JTT_STRAIGHT_INNER = JTT_STRAIGHT | JTT_INNER,
+   JTT_NATURAL_INNER = JTT_NATURAL | JTT_INNER,
+diff --git a/sql/psi_memory_key.cc b/sql/psi_memory_key.cc
+index 8c94f84f85c..21835ccac6e 100644
+--- a/sql/psi_memory_key.cc
++++ b/sql/psi_memory_key.cc
+@@ -108,6 +108,7 @@ PSI_memory_key key_memory_errmsgs_handler;
+ PSI_memory_key key_memory_handlerton_objects;
+ PSI_memory_key key_memory_hash_index_key_buffer;
+ PSI_memory_key key_memory_hash_join;
++PSI_memory_key key_memory_hash_join_full_outer;
+ PSI_memory_key key_memory_help;
+ PSI_memory_key key_memory_histograms;
+ PSI_memory_key key_memory_host_cache_hostname;
+@@ -375,6 +376,8 @@ static PSI_memory_info all_server_memory[] = {
+     {&key_memory_histograms, "histograms", 0, 0, PSI_DOCUMENT_ME},
+     {&key_memory_hash_join, "hash_join", PSI_FLAG_MEM_COLLECT, 0,
+      PSI_DOCUMENT_ME},
++    {&key_memory_hash_join_full_outer, "hash_join_full_outer", PSI_FLAG_MEM_COLLECT, 0,
++     PSI_DOCUMENT_ME},
+     {&key_memory_rm_table_foreach_root, "rm_table::foreach_root",
+      PSI_FLAG_THREAD, 0,
+      "Mem root for temporary objects allocated while dropping tables or the "
+diff --git a/sql/psi_memory_key.h b/sql/psi_memory_key.h
+index fbdb0aa7c91..34ea1bdc306 100644
+--- a/sql/psi_memory_key.h
++++ b/sql/psi_memory_key.h
+@@ -133,6 +133,7 @@ extern PSI_memory_key key_memory_errmsgs_handler;
+ extern PSI_memory_key key_memory_handlerton_objects;
+ extern PSI_memory_key key_memory_hash_index_key_buffer;
+ extern PSI_memory_key key_memory_hash_join;
++extern PSI_memory_key key_memory_hash_join_full_outer;
+ extern PSI_memory_key key_memory_help;
+ extern PSI_memory_key key_memory_histograms;
+ extern PSI_memory_key key_memory_host_cache_hostname;
+diff --git a/sql/sql_executor.cc b/sql/sql_executor.cc
+index e440daec773..74e88c81298 100644
+--- a/sql/sql_executor.cc
++++ b/sql/sql_executor.cc
+@@ -1327,13 +1327,13 @@ enum class Substructure { NONE, OUTER_JOIN, SEMIJOIN, WEEDOUT };
+ static Substructure FindSubstructure(
+     QEP_TAB *qep_tabs, const plan_idx first_idx, const plan_idx this_idx,
+     const plan_idx last_idx, CallingContext calling_context, bool *add_limit_1,
+-    plan_idx *substructure_end, qep_tab_map *unhandled_duplicates) {
++    plan_idx *substructure_end, qep_tab_map *unhandled_duplicates, bool *full_outer_flag) {
+   QEP_TAB *qep_tab = &qep_tabs[this_idx];
+   bool is_outer_join =
+       qep_tab->last_inner() != NO_PLAN_IDX && qep_tab->last_inner() < last_idx;
+   plan_idx outer_join_end =
+       qep_tab->last_inner() + 1;  // Only valid if is_outer_join.
+-
++  bool is_full_outer_join = qep_tab->full_outer_flag();
+   // See if this table marks the end of the left side of a semijoin.
+   bool is_semijoin = false;
+   plan_idx semijoin_end = NO_PLAN_IDX;
+@@ -1480,6 +1480,9 @@ static Substructure FindSubstructure(
+   }
+   if (is_outer_join) {
+     *substructure_end = outer_join_end;
++    if (is_full_outer_join) {
++      *full_outer_flag = true;
++    }
+     return Substructure::OUTER_JOIN;
+   }
+   if (is_weedout) {
+@@ -2005,7 +2008,7 @@ static AccessPath *CreateHashJoinAccessPath(
+     THD *thd_g, QEP_TAB *qep_tab, AccessPath *build_path,
+     qep_tab_map build_tables, AccessPath *probe_path, qep_tab_map probe_tables,
+     JoinType join_type, vector<Item *> *join_conditions,
+-    table_map *conditions_depend_on_outer_tables) {
++    table_map *conditions_depend_on_outer_tables, bool full_outer_flag = false) {
+   table_map left_table_map =
+       ConvertQepTabMapToTableMap(qep_tab->join(), probe_tables);
+   table_map right_table_map =
+@@ -2148,7 +2151,11 @@ static AccessPath *CreateHashJoinAccessPath(
+       expr->type = RelationalExpression::INNER_JOIN;
+       break;
+     case JoinType::OUTER:
+-      expr->type = RelationalExpression::LEFT_JOIN;
++      if (full_outer_flag) {
++        expr->type = RelationalExpression::FULL_OUTER_JOIN;
++      } else {
++        expr->type = RelationalExpression::LEFT_JOIN;
++      }
+       break;
+     case JoinType::SEMI:
+       expr->type = RelationalExpression::SEMIJOIN;
+@@ -2466,9 +2473,10 @@ AccessPath *ConnectJoins(plan_idx upper_first_idx, plan_idx first_idx,
+ 
+     bool add_limit_1;
+     plan_idx substructure_end;
++    bool full_outer_flag = false;
+     Substructure substructure =
+         FindSubstructure(qep_tabs, first_idx, i, last_idx, calling_context,
+-                         &add_limit_1, &substructure_end, unhandled_duplicates);
++                         &add_limit_1, &substructure_end, unhandled_duplicates, &full_outer_flag);
+ 
+     // Get the index of the table where semijoin hash iterator would be created.
+     // Used in placing the join conditions attached to the tables that are on
+@@ -2681,11 +2689,13 @@ AccessPath *ConnectJoins(plan_idx upper_first_idx, plan_idx first_idx,
+         } else {
+           path = CreateHashJoinAccessPath(
+               thd_g, qep_tab, subtree_path, right_tables, path, left_tables,
+-              join_type, &join_conditions, conditions_depend_on_outer_tables);
++              join_type, &join_conditions, conditions_depend_on_outer_tables, &full_outer_flag);
+         }
+ 
+         path = PossiblyAttachFilter(path, join_conditions, thd_g,
+                                     conditions_depend_on_outer_tables);
++      } else if (full_outer_flag) {
++        LogErr(ERROR_LEVEL, ER_READING_TABLE_FAILED);
+       } else {
+         // Normally, subtree_pending_join_conditions should be empty when we
+         // create a nested loop iterator. However, in the case where we thought
+diff --git a/sql/sql_opt_exec_shared.h b/sql/sql_opt_exec_shared.h
+index 4b5430e3e06..b4faeb18f1e 100644
+--- a/sql/sql_opt_exec_shared.h
++++ b/sql/sql_opt_exec_shared.h
+@@ -286,11 +286,13 @@ class QEP_shared {
+   plan_idx first_inner() { return m_first_inner; }
+   void set_first_inner(plan_idx i) { m_first_inner = i; }
+   void set_last_inner(plan_idx i) { m_last_inner = i; }
++  void set_full_outer_flag(bool flag) { m_full_outer_flag = flag; }
+   void set_first_sj_inner(plan_idx i) { m_first_sj_inner = i; }
+   void set_last_sj_inner(plan_idx i) { m_last_sj_inner = i; }
+   void set_first_upper(plan_idx i) { m_first_upper = i; }
+   plan_idx last_inner() { return m_last_inner; }
+   plan_idx first_upper() { return m_first_upper; }
++  bool full_outer_flag() { return m_full_outer_flag; }
+   Index_lookup &ref() { return *m_ref; }
+   void set_ref(Index_lookup *ref) { m_ref = ref; }
+   Index_lookup &old_ref() { return *m_old_ref; }
+@@ -411,6 +413,8 @@ class QEP_shared {
+   plan_idx m_first_inner;  ///< first inner table for including outer join
+   plan_idx m_last_inner;   ///< last table table for embedding outer join
+   plan_idx m_first_upper;  ///< first inner table for embedding outer join
++  bool m_full_outer_flag;
++  bool m_semi_flag;
+ 
+   /**
+      Used to do index-based look up based on a key value.
+@@ -533,11 +537,13 @@ class QEP_shared_owner {
+   plan_idx first_inner() const { return m_qs->first_inner(); }
+   plan_idx last_inner() const { return m_qs->last_inner(); }
+   plan_idx first_upper() const { return m_qs->first_upper(); }
++  bool full_outer_flag() const { return m_qs->full_outer_flag(); }
+   void set_first_inner(plan_idx i) { return m_qs->set_first_inner(i); }
+   void set_last_inner(plan_idx i) { return m_qs->set_last_inner(i); }
+   void set_first_sj_inner(plan_idx i) { return m_qs->set_first_sj_inner(i); }
+   void set_last_sj_inner(plan_idx i) { return m_qs->set_last_sj_inner(i); }
+   void set_first_upper(plan_idx i) { return m_qs->set_first_upper(i); }
++  void set_full_outer_flag(bool flag) { m_qs->set_full_outer_flag(flag); }
+   Index_lookup &ref() const { return m_qs->ref(); }
+   void set_ref(Index_lookup *ref) { m_qs->set_ref(ref); }
+   Index_lookup &old_ref() const { return m_qs->old_ref(); }
+diff --git a/sql/sql_optimizer.cc b/sql/sql_optimizer.cc
+index ea6c139e513..7a86f158366 100644
+--- a/sql/sql_optimizer.cc
++++ b/sql/sql_optimizer.cc
+@@ -8662,6 +8662,9 @@ void JOIN::make_outerjoin_info() {
+         (Like table t4 for the table reference t3 LEFT JOIN t4 ON t3.a=t4.a
+         is in the query above.)
+       */
++      if (tbl->full_outer_join) {
++        tab->set_full_outer_flag(true);
++      }
+       tab->set_last_inner(i);
+       tab->set_first_inner(i);
+       tab->init_join_cond_ref(tbl);
+diff --git a/sql/sql_yacc.yy b/sql/sql_yacc.yy
+index 86dce47dd54..93b65daa25e 100644
+--- a/sql/sql_yacc.yy
++++ b/sql/sql_yacc.yy
+@@ -1390,6 +1390,7 @@ void warn_about_deprecated_binary(THD *thd_g)
+ 
+ //gaiadb token as follows:
+ %token<lexer.keyword> REVERSE_WORDS_SYM 1208
++%token FULL_OUTER_SYM 1209
+ 
+ /*
+   Precedence rules used to resolve the ambiguity when using keywords as idents
+@@ -1421,7 +1422,7 @@ void warn_about_deprecated_binary(THD *thd_g)
+ %left UNION_SYM EXCEPT_SYM
+ %left INTERSECT_SYM
+ %left CONDITIONLESS_JOIN
+-%left   JOIN_SYM INNER_SYM CROSS STRAIGHT_JOIN NATURAL LEFT RIGHT ON_SYM USING
++%left   JOIN_SYM INNER_SYM CROSS STRAIGHT_JOIN NATURAL LEFT RIGHT ON_SYM USING FULL_OUTER_SYM
+ %left   SET_VAR
+ %left   OR_SYM OR2_SYM
+ %left   XOR
+@@ -1975,6 +1976,8 @@ void warn_about_deprecated_binary(THD *thd_g)
+ 
+ %type <join_type> outer_join_type natural_join_type inner_join_type
+ 
++%type <join_type> full_outer_join_type
++
+ %type <user_list> user_list role_list default_role_clause opt_except_role_list
+ 
+ %type <alter_instance_cmd> alter_instance_action
+@@ -12061,6 +12064,14 @@ joined_table:
+           {
+             $$= NEW_PTN PT_joined_table_using($1, @2, $2, $3);
+           }
++        | table_reference full_outer_join_type table_reference ON_SYM expr
++          {
++            $$= NEW_PTN PT_joined_table_on($1, @2, $2, $3, $5);
++          }
++        ;
++
++full_outer_join_type:
++          FULL_OUTER_SYM JOIN_SYM         { $$= JTT_FULL_OUTER; }
+         ;
+ 
+ natural_join_type:
+diff --git a/sql/table.h b/sql/table.h
+index 08c57c747d2..e47cb136adf 100644
+--- a/sql/table.h
++++ b/sql/table.h
+@@ -3708,6 +3708,7 @@ struct TABLE_LIST {
+   bool m_fulltext_searched{false};  ///< True if fulltext searched
+  public:
+   bool straight{false}; /* optimize with prev table */
++  bool full_outer_join{false}; /* full outer join */
+   /**
+     True for tables and views being changed in a data change statement.
+     Also true for tables subject to a SELECT ... FOR UPDATE.
+-- 
+2.28.0
+
