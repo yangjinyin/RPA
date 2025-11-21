@@ -1,0 +1,1374 @@
+diff --git a/.gitignore b/.gitignore
+index 5e696f6..ce4e9f9 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -18,7 +18,7 @@ source_downloads
+ 
+ # Configuration files for Visual Studio Code
+ .vscode/
+-
++build/
+ build/output
+ build/release
+ build/compute_node
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f638816..4d337e6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1587,6 +1587,8 @@ ADD_DEFINITIONS(-D__STDC_FORMAT_MACROS)    # Enable C99 printf format macros
+ ADD_DEFINITIONS(-D_USE_MATH_DEFINES)       # Get access to M_PI, M_E, etc. in math.h
+ ADD_DEFINITIONS(-DLZ4_DISABLE_DEPRECATE_WARNINGS) # C++14 deprecation warnings in LZ4.
+ 
++INCLUDE(cmake/gaia.cmake)
++
+ OPTION(ENABLE_EXPERIMENT_SYSVARS "Expose ussually hidden system variables to allow experiments" OFF)
+ IF(ENABLE_EXPERIMENT_SYSVARS)
+   ADD_DEFINITIONS(-DENABLE_EXPERIMENT_SYSVARS)
+diff --git a/cmake/gaia.cmake b/cmake/gaia.cmake
+new file mode 100644
+index 0000000..b7a9d8e
+--- /dev/null
++++ b/cmake/gaia.cmake
+@@ -0,0 +1,9 @@
++IF(WIN32)
++  MESSAGE(FATAL_ERROR "No windows supported!!")
++  RETURN()
++ENDIF()
++
++# Feature: plan cache
++# Version: gaia4.0
++# Note: XXXX
++ADD_DEFINITIONS(-DHAVE_GAIA_PLAN_CACHE)
+diff --git a/share/messages_to_clients.txt b/share/messages_to_clients.txt
+index 0b6962f..a7119b1 100644
+--- a/share/messages_to_clients.txt
++++ b/share/messages_to_clients.txt
+@@ -9837,6 +9837,8 @@ ER_BAD_TIMESTAMP_FORMAT
+ ER_SHAPE_PRIDICTION_UDF
+   eng "SHAPE_PREDICTION UDF %s got error because of %s."
+ 
++ER_WARN_UNSUPPORTED_PLAN_CACHE
++  eng "USE_PLAN_CACHE hint is supported by top-level standalone SELECT statements only"
+ #
+ #  End of 8.0 error messages (server-to-client).
+ #  Do NOT add messages intended for the error log above!
+diff --git a/sql/CMakeLists.txt b/sql/CMakeLists.txt
+index 42666a5..03ccd7c 100644
+--- a/sql/CMakeLists.txt
++++ b/sql/CMakeLists.txt
+@@ -473,6 +473,7 @@ SET(SQL_SHARED_SOURCES
+   query_term.cc
+   parse_tree_partitions.cc
+   parse_tree_window.cc
++  plan_cache.cc
+   select_lex_visitor.cc
+   parser_service.cc
+   partition_info.cc
+diff --git a/sql/join_optimizer/access_path.h b/sql/join_optimizer/access_path.h
+index 759a629..5c561ea 100644
+--- a/sql/join_optimizer/access_path.h
++++ b/sql/join_optimizer/access_path.h
+@@ -67,6 +67,9 @@ struct POSITION;
+ struct RelationalExpression;
+ struct TABLE;
+ struct TABLE_REF;
++#ifdef HAVE_GAIA_PLAN_CACHE
++class Table_ident;
++#endif
+ 
+ /**
+   A specification that two specific relational expressions
+@@ -910,6 +913,9 @@ struct AccessPath {
+     struct {
+       TABLE *table;
+       TABLE_REF *ref;
++#ifdef HAVE_GAIA_PLAN_CACHE
++      Table_ident *table_ident;  // For use with plan cache
++#endif      
+       bool use_order;
+       bool reverse;
+     } ref;
+@@ -1065,6 +1071,10 @@ struct AccessPath {
+       // No members (implicit from the JOIN).
+     } table_value_constructor;
+     struct {
++#ifdef HAVE_GAIA_PLAN_CACHE
++       Table_ident *table_ident;  // For use with plan cache
++       TABLE_REF *ref;      //For use with plan cache
++#endif
+       // No members.
+     } fake_single_row;
+     struct {
+diff --git a/sql/lex.h b/sql/lex.h
+index d7387c4..3957ca6 100644
+--- a/sql/lex.h
++++ b/sql/lex.h
+@@ -877,6 +877,9 @@ static const SYMBOL symbols[] = {
+     /*
+       Insert new optimizer hint keywords after that commentary:
+     */
++#ifdef HAVE_GAIA_PLAN_CACHE
++    {SYM_H("PLAN_CACHE", PLAN_CACHE_HINT)},
++#endif
+     {SYM_H("PQ", PQ_HINT)},
+     {SYM_H("NO_PQ", NO_PQ_HINT)},
+     {SYM_H("BKA", BKA_HINT)},
+diff --git a/sql/mysqld.cc b/sql/mysqld.cc
+index 7ad3582..3675e1c 100644
+--- a/sql/mysqld.cc
++++ b/sql/mysqld.cc
+@@ -982,7 +982,9 @@ MySQL clients support the protocol:
+ #include <gflags/gflags.h>
+ #include <gaiadb/polar/cpu_affinity.h>
+ #include <gaiadb/utils/utils.h>
+-
++#ifdef HAVE_GAIA_PLAN_CACHE
++#include "sql/plan_cache.h" //plan_cache
++#endif
+ using std::max;
+ using std::min;
+ using std::vector;
+@@ -1882,6 +1884,9 @@ Gtid_table_persistor *gtid_table_persistor = nullptr;
+ 
+ /* cache for persisted variables */
+ static Persisted_variables_cache persisted_variables_cache;
++#ifdef HAVE_GAIA_PLAN_CACHE
++static Plan_cache_singleton s_plan_cache;
++#endif
+ 
+ void persisted_variables_refresh_keyring_support() {
+   persisted_variables_cache.keyring_support_available();
+@@ -2950,6 +2955,10 @@ static void clean_up(bool print_message) {
+     tc_log = nullptr;
+   }
+ 
++#ifdef HAVE_GAIA_PLAN_CACHE
++  s_plan_cache.destroy();
++#endif  
++
+   if (dd::upgrade_57::in_progress()) delete_dictionary_tablespace();
+ 
+   Recovered_xa_transactions::destroy();
+@@ -8223,7 +8232,9 @@ int mysqld_main(int argc, char **argv)
+     send_service_status(msg);
+   }
+ #endif
+-
++#ifdef HAVE_GAIA_PLAN_CACHE
++  s_plan_cache.initialize();
++#endif
+   /* Determine default TCP port and unix socket name */
+   set_ports();
+ 
+@@ -10567,6 +10578,10 @@ SHOW_VAR status_vars[] = {
+      SHOW_SCOPE_GLOBAL},
+     {"Resource_group_supported", (char *)show_resource_group_support, SHOW_FUNC,
+      SHOW_SCOPE_GLOBAL},
++#ifdef HAVE_GAIA_PLAN_CACHE
++    {"Plan_cache_total_use", (char *)&plan_cache_total_use,SHOW_LONG, SHOW_SCOPE_GLOBAL},
++    {"Plan_cache_map_size", (char *)&plan_cache_map_size, SHOW_LONG, SHOW_SCOPE_GLOBAL},
++#endif     
+     {NullS, NullS, SHOW_LONG, SHOW_SCOPE_ALL}};
+ 
+ void add_terminator(vector<my_option> *options) {
+@@ -12502,6 +12517,9 @@ PSI_rwlock_key key_rwlock_channel_lock;
+ PSI_rwlock_key key_rwlock_receiver_sid_lock;
+ PSI_rwlock_key key_rwlock_rpl_filter_lock;
+ PSI_rwlock_key key_rwlock_channel_to_filter_lock;
++#ifdef HAVE_GAIA_PLAN_CACHE
++PSI_rwlock_key key_rwlock_LOCK_plan_cache;
++#endif
+ 
+ PSI_rwlock_key key_rwlock_Trans_delegate_lock;
+ PSI_rwlock_key key_rwlock_Server_state_delegate_lock;
+@@ -12539,6 +12557,9 @@ static PSI_rwlock_info all_server_rwlocks[]=
+ #endif // _WIN32
+   { &key_rwlock_LOCK_filter_list, "LOCK_filter_list", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
+   { &key_rwlock_LOCK_ip_whitelist_list, "LOCK_ip_whitelist_list", PSI_FLAG_SINGLETON, 0, PSI_DOCUMENT_ME},
++#ifdef HAVE_GAIA_PLAN_CACHE
++  { &key_rwlock_LOCK_plan_cache, "LOCK_plan_cache", 0, 0, PSI_DOCUMENT_ME},
++#endif
+ };
+ /* clang-format on */
+ 
+diff --git a/sql/mysqld.h b/sql/mysqld.h
+index f1911e1..4a69997 100644
+--- a/sql/mysqld.h
++++ b/sql/mysqld.h
+@@ -518,6 +518,9 @@ extern PSI_rwlock_key key_rwlock_channel_to_filter_lock;
+ extern PSI_rwlock_key key_rwlock_resource_group_mgr_map_lock;
+ extern PSI_rwlock_key key_rwlock_LOCK_filter_list;
+ extern PSI_rwlock_key key_rwlock_LOCK_ip_whitelist_list;
++#ifdef HAVE_GAIA_PLAN_CACHE
++extern PSI_rwlock_key key_rwlock_LOCK_plan_cache;
++#endif
+ 
+ extern PSI_cond_key key_PAGE_cond;
+ extern PSI_cond_key key_COND_active;
+diff --git a/sql/opt_hints.h b/sql/opt_hints.h
+index 9312c51..b1da5fb 100644
+--- a/sql/opt_hints.h
++++ b/sql/opt_hints.h
+@@ -86,6 +86,7 @@ enum opt_hints_enum {
+   PQ_HINT_ENUM,
+   NO_PQ_HINT_ENUM,
+   DERIVED_CONDITION_PUSHDOWN_HINT_ENUM,
++  PLAN_CACHE_HINT_ENUM,
+   MAX_HINT_ENUM
+ };
+ 
+diff --git a/sql/parse_tree_hints.cc b/sql/parse_tree_hints.cc
+index 0c4d81b..938fc8a 100644
+--- a/sql/parse_tree_hints.cc
++++ b/sql/parse_tree_hints.cc
+@@ -221,6 +221,24 @@ void PT_hint::print_warn(THD *thd_g, uint err_code,
+                       ER_THD_NONCONST(thd_g, err_code), str.c_ptr_safe());
+ }
+ 
++#ifdef HAVE_GAIA_PLAN_CACHE
++static bool support_plan_cache(Parse_context *pc) {
++  assert(pc->thd_g != nullptr && pc->thd_g->lex != nullptr);
++
++  if (pc->thd_g->lex->sql_command != SQLCOM_SELECT ||  // not a SELECT statement
++      pc->thd_g->lex->sphead ||                        // or in a SP/trigger/event
++      pc->select != pc->thd_g->lex->query_block_g)       // or in a subquery
++  {
++    push_warning(pc->thd_g, Sql_condition::SL_WARNING,
++                 ER_WARN_UNSUPPORTED_PLAN_CACHE,
++                 ER_THD(pc->thd_g, ER_WARN_UNSUPPORTED_PLAN_CACHE));
++    return false;
++  }
++
++  return true;
++}
++#endif
++
+ bool PT_qb_level_hint::contextualize(Parse_context *pc) {
+   if (super::contextualize(pc)) return true;
+ 
+@@ -270,6 +288,13 @@ bool PT_qb_level_hint::contextualize(Parse_context *pc) {
+       else
+         pc->select->add_base_options(SELECT_STRAIGHT_JOIN);
+       break;
++#ifdef HAVE_GAIA_PLAN_CACHE
++    case PLAN_CACHE_HINT_ENUM:
++      if (!support_plan_cache(pc)) break;
++
++      pc->thd_g->lex->plan_cache_type = enum_use_plan_cache_type::PC_HINT_DEFAULT;
++      break;
++#endif
+     case PQ_HINT_ENUM:
+       if (args > 0)
+         pc->thd_g->pq_dop = args;
+diff --git a/sql/parse_tree_hints.h b/sql/parse_tree_hints.h
+index c3d7de3..fdffa10 100644
+--- a/sql/parse_tree_hints.h
++++ b/sql/parse_tree_hints.h
+@@ -41,6 +41,13 @@ class Item;
+ class THD;
+ struct MEM_ROOT;
+ 
++#ifdef HAVE_GAIA_PLAN_CACHE
++enum enum_use_plan_cache_type {
++  PC_NO_HINT = 0,  
++  PC_HINT_DEFAULT,
++};
++#endif
++
+ struct Hint_param_table {
+   LEX_CSTRING table;
+   LEX_CSTRING opt_query_block;
+diff --git a/sql/plan_cache.cc b/sql/plan_cache.cc
+new file mode 100644
+index 0000000..15e6eff
+--- /dev/null
++++ b/sql/plan_cache.cc
+@@ -0,0 +1,527 @@
++#include "sql/plan_cache.h"
++
++#include <string>
++
++#include "my_alloc.h"
++#include "my_inttypes.h"
++#include "sql/join_optimizer/access_path.h"
++#include "sql/key.h"
++#include "sql/mysqld.h"
++#include "sql/sql_executor.h"
++#include "sql/sql_lex.h"
++#include "sql/sql_opt_exec_shared.h"
++#include "sql/sql_optimizer.h"
++#include "sql/sql_prepare.h"
++#include "sql/table.h"
++
++ulong plan_cache_map_size = 0;
++ulong plan_cache_total_use = 0;
++
++#ifdef HAVE_GAIA_PLAN_CACHE
++
++Plan_cache_singleton *Plan_cache_singleton::instance = nullptr;
++/**
++ * @brief Cache a Plan_cache_body
++ *
++ * Insert the mapping relationship of plan_cache_entry into plan_cache_map
++ *
++ * @param[in] query_str The hash value to be cached (key)
++ * @param[in] plan_cache_entry The object class to be cached (value)
++ *
++ * @retval true Cache failed
++ * @retval false Cache successful
++ */
++bool Plan_cache_singleton::insert(const std::string &query_str,
++                        Plan_cache_entry *plan_cache_entry)
++{
++  assert(plan_cache_entry);
++
++  Plan_cache_wrlock lock(&m_lock);
++
++  /**if exist, then skip it */
++  if (m_plan_cache_map.find(query_str) != m_plan_cache_map.end()) return false;
++
++  m_plan_cache_map.insert(std::make_pair(query_str, plan_cache_entry));
++
++  /**update table_cache_map*/
++  for (LEX_STRING &table_key : plan_cache_entry->get_table_ids()) {
++    std::string key(table_key.str, table_key.length);
++    m_table_cache_map[key].insert((query_str));
++  }
++
++  /**update statistics info*/
++  plan_cache_map_size++;
++
++  return false;
++}
++
++/**
++ * @brief Get a cache object
++ *
++ * Get the plan_cache_entry object through hash
++ *
++ * @param[in] query_hash The key value of the cache object to be queried
++ * @return Returns the cache object found, if not, returns nullptr
++ */
++Plan_cache_entry *Plan_cache_singleton::get(const std::string &query_hash) {
++  Plan_cache_rdlock lock(&m_lock);
++
++  auto it = m_plan_cache_map.find(query_hash);
++  if (it != m_plan_cache_map.end()) return it->second;
++  return nullptr;
++}
++
++bool Plan_cache_singleton::exist(const std::string &key) {
++  Plan_cache_rdlock lock(&m_lock);
++
++  return m_plan_cache_map.find(key) != m_plan_cache_map.end();
++}
++
++/**
++ * @brief when do ddl operation, remove the cache which related to the table
++ */
++bool Plan_cache_singleton::remove(const std::string &table_key) {
++  Plan_cache_wrlock lock(&m_lock);
++
++  //1.find digest_string_hash from table_cache_map according to table_key
++  auto it = m_table_cache_map.find(table_key);
++  if (it == m_table_cache_map.end()) {
++    return true;                        //not exist
++  }
++  
++  //2. remove plan_cache_map according to digest_query_hash
++  auto digest_query_hash = it->second;
++  for (auto &query_hash : digest_query_hash) {
++    auto it_plan_cache = m_plan_cache_map.find(query_hash);
++    if (it_plan_cache != m_plan_cache_map.end()) {
++      /* 
++       There may be a memory leak, it is recommended to use memory pool management later
++       TODO: use memory pool !!!
++      */
++      delete it_plan_cache->second;            
++      m_plan_cache_map.erase(it_plan_cache);
++      plan_cache_map_size--;
++    }
++  }
++
++  /**update statistics info*/
++  return false;
++}
++
++/**
++ * @brief Determine whether to enable plan cache
++ *
++ * @retval true Enable plan cache
++ * @retval false Disable plan cache
++ */
++bool use_plan_cache(THD *thd_g) {
++  assert(thd_g != nullptr && thd_g->lex != nullptr);
++
++  return thd_g->lex->plan_cache_type ==
++             enum_use_plan_cache_type::PC_HINT_DEFAULT ||
++         thd_g->variables.plan_cache_enable;
++}
++
++static Table_ident *make_table_ident(Table_ref *table_list) {
++  auto make_string = [](const char *ptr, size_t len) -> LEX_CSTRING {
++    char *pos;
++    if ((pos = static_cast<char *>(new char[len + 1]))) {
++      if (len > 0) memcpy(pos, ptr, len);
++      pos[len] = 0;
++    }
++    return {pos, len};
++  };
++
++  return new Table_ident(
++      make_string(table_list->db, table_list->db_length),
++      make_string(table_list->alias, strlen(table_list->alias)));
++}
++
++/**
++  copy the context of the from_ref to to_ref
++
++  @param to_ref[in/out] The assigned Index_lookup is saved to the plan cache
++  @param from_ref       Index_lookup currently executed
++*/
++static void plan_cache_copy_table_ref(Index_lookup *to_ref,
++                                      Index_lookup *from_ref) {
++  to_ref->key_err = from_ref->key_err;
++  to_ref->key_parts = from_ref->key_parts;
++  to_ref->key_length = from_ref->key_length;
++  to_ref->key = from_ref->key;
++  to_ref->null_rejecting = from_ref->null_rejecting;
++  to_ref->depend_map = from_ref->depend_map;
++  to_ref->use_count = from_ref->use_count;
++  to_ref->disable_cache = from_ref->disable_cache;
++
++  to_ref->key_buff = new u_char[ALIGN_SIZE(from_ref->key_length)];
++  to_ref->key_buff2 = new u_char[ALIGN_SIZE(from_ref->key_length)];
++  to_ref->key_copy = new store_key *[from_ref->key_parts];
++  to_ref->items = new Item *[from_ref->key_parts];
++  to_ref->cond_guards = new bool *[from_ref->key_parts];
++  to_ref->item_pos_in_query = new int[from_ref->key_parts];
++
++  memcpy(to_ref->key_buff, from_ref->key_buff, from_ref->key_length);
++
++  if (from_ref->null_ref_key != nullptr) {
++    to_ref->null_ref_key = to_ref->key_buff;
++  }
++
++  for (uint i = 0; i < from_ref->key_parts; i++) {
++    /***
++      Here, each Item of Index_lookup has lost its name information. For example,
++      id = 1, Index_lookup will only save Item_int(1). At this time, it is no
++      longer known that the Iten_field corresponding to 1 is id. So in
++      PrepareStatement, the plan cache needs to save the location corresponding
++      to the Item.
++    */
++    if (from_ref->items[i]->type() == Item::PARAM_ITEM) {
++      Item_param *param = down_cast<Item_param *>(from_ref->items[i]);
++      to_ref->item_pos_in_query[i] = param->pos_in_query;
++    } else {
++      to_ref->item_pos_in_query[i] = -1;
++    }
++
++    to_ref->cond_guards[i] = from_ref->cond_guards[i];
++  }
++
++  to_ref->cache_value_impossible_null_ref = from_ref->impossible_null_ref();
++  to_ref->cache_impossible_null_ref = true;
++}
++
++/**
++  Store the context of the from_path to to_path for plan cache
++  NOTE: Now just support ref and FAKE_SINGLE_ROW case.
++
++  @param to_path[in/out] The assigned access_path is saved to the plan cache
++  @param from_join    JOIN currently executed
++  @param from_path    AccessPath currently executed
++  @param error[in/out] If there is an unsupported type, error = true
++  @param table_keys[in/out]    Table keys currently executed
++ */
++static void stmt_store_access_path(AccessPath *to_path, JOIN *from_join,
++                                   AccessPath *from_path, bool &error,
++                                   std::list<LEX_STRING> &table_keys) {
++  assert(from_path != nullptr);
++
++  to_path->type = from_path->type;
++
++  auto process_table_list = [&](Table_ref *table_list) {
++    assert(table_list != nullptr);
++    assert(!is_temporary_table(table_list));
++    LEX_STRING key;
++    key.length = table_list->table->s->table_cache_key.length;
++    key.str = new char[key.length];
++    memcpy(key.str, table_list->table->s->table_cache_key.str, key.length);
++
++    table_keys.push_back(key);
++    return make_table_ident(table_list);
++  };
++
++  switch (from_path->type) {
++    case AccessPath::REF: {
++      auto table_ident =
++          process_table_list(from_path->ref().table->pos_in_table_list);
++      Index_lookup *ref = new Index_lookup();
++      assert(ref);
++      plan_cache_copy_table_ref(ref, from_path->ref().ref);
++
++      to_path->ref().table_ident = table_ident;
++      to_path->ref().ref = ref;
++      to_path->ref().use_order = from_path->ref().use_order;
++      to_path->ref().reverse = from_path->ref().reverse;
++
++      break;
++    }
++    case AccessPath::FILTER: {
++      AccessPath *child = new AccessPath();
++      stmt_store_access_path(child, from_join, from_path->filter().child, error, table_keys);
++      to_path->filter().child = child;
++      to_path->filter().materialize_subqueries =
++          from_path->filter().materialize_subqueries;
++      break;
++    }
++    case AccessPath::FAKE_SINGLE_ROW: {
++      // muliple const table is not supported
++      if (from_join->const_tables != 1) {
++        error = true;
++        return;
++      }
++
++      to_path->fake_single_row().ref = new Index_lookup();
++
++      auto table_ident = process_table_list(from_join->qep_tab[0].table_ref);
++
++      Index_lookup *to_ref = new Index_lookup();
++      plan_cache_copy_table_ref(to_ref, &from_join->qep_tab[0].ref());
++
++      to_path->fake_single_row().table_ident = table_ident;
++      to_path->fake_single_row().ref = to_ref;
++
++      break;
++    }  // todo: it will support other case in the future !!!
++    default:
++      error = true;
++      return;
++  }
++  return;
++}
++
++/**
++  Restore the context of the from_ref to to_ref
++
++  @param thd_g[in]        THD currently executed
++  @param to_ref[in/out] Index_lookup currently executed
++  @param from_ref       The assigned Index_lookup is saved to the plan cache
++  @param exe_stmt       Prepared_statement currently executed
++  @param exe_table      TABLE currently executed
++
++  @note
++    To malloc for all objects, use new (thd_g->mem_root)
++*/
++static void stmt_table_ref_restore(THD* thd_g, Index_lookup *to_ref,
++                                   Prepared_statement *exe_stmt,
++                                   TABLE *exe_table, Index_lookup *from_ref) {
++  MEM_ROOT *mem_root = thd_g->mem_root;
++
++  to_ref->key_err = from_ref->key_err;
++  to_ref->key_parts = from_ref->key_parts;
++  to_ref->key_length = from_ref->key_length;
++  to_ref->key = from_ref->key;
++  to_ref->null_rejecting = from_ref->null_rejecting;
++  to_ref->depend_map = from_ref->depend_map;
++  to_ref->use_count = from_ref->use_count;
++  to_ref->disable_cache = from_ref->disable_cache;
++
++  // NOTE: use thd_g->mem_root
++  to_ref->key_buff =
++      mem_root->ArrayAlloc<u_char>(ALIGN_SIZE(from_ref->key_length));
++  to_ref->key_buff2 =
++      mem_root->ArrayAlloc<u_char>(ALIGN_SIZE(from_ref->key_length));
++  to_ref->key_copy = mem_root->ArrayAlloc<store_key *>(from_ref->key_parts);
++  to_ref->items = mem_root->ArrayAlloc<Item *>(from_ref->key_parts);
++  to_ref->cond_guards = mem_root->ArrayAlloc<bool *>(from_ref->key_parts);
++  assert(from_ref->item_pos_in_query != nullptr);
++  memcpy(to_ref->key_buff, from_ref->key_buff, from_ref->key_length);
++
++  if (from_ref->null_ref_key != nullptr) {
++    to_ref->null_ref_key = to_ref->key_buff;
++  }
++
++  Item_param **param_array = exe_stmt->m_param_array;
++  uint param_count = exe_stmt->m_param_count;
++  assert(from_ref->key_parts > 0);
++
++  KEY *const keyinfo = exe_table->key_info + from_ref->key;
++  u_char *key_buff = to_ref->key_buff;
++
++  for (uint i = 0; i < from_ref->key_parts; i++) {
++    if (from_ref->item_pos_in_query[i] == -1) {
++      key_buff += keyinfo->key_part[i].store_length;
++      continue;
++    }
++    for (uint j = 0; j < param_count; j++) {
++      /***
++        Plan cache caches the location of the Item corresponding to the
++        generated Index_lookup. In PrepareStatement, each corresponding Item also
++        has its location. So if the positions match, the Item of
++        PrepareStatement is the Item when it is executed at this time.
++      */
++      if (static_cast<uint>(from_ref->item_pos_in_query[i]) ==
++          param_array[j]->pos_in_query) {
++        to_ref->items[i] = (Item *)param_array[j];
++        store_key *s_key = new (mem_root)
++            store_key(thd_g, keyinfo->key_part[i].field, key_buff,
++                      nullptr, keyinfo->key_part[i].length, to_ref->items[i]);
++        s_key->copy();
++        key_buff += keyinfo->key_part[i].store_length;
++
++        // need by construct_lookup_ref for ref
++        to_ref->key_copy[i] = s_key;
++        break;
++      }
++    }
++
++    to_ref->cond_guards[i] = from_ref->cond_guards[i];
++  }
++
++  to_ref->cache_impossible_null_ref = from_ref->cache_impossible_null_ref;
++  to_ref->cache_value_impossible_null_ref = from_ref->cache_value_impossible_null_ref;
++}
++
++/**
++  Assign the contents of JOIN to JoinContext
++
++  NOTE: from_join is the JOIN executed
++ */
++static void stmt_join_store(JoinContext *to_join, JOIN *from_join) {
++  to_join->tables = from_join->tables;
++  to_join->const_tables = from_join->const_tables;
++  to_join->primary_tables = from_join->primary_tables;
++}
++
++/**
++  Store the context of the PrepareStatement statement optimizer in the plan
++  cache
++
++  @param exe_stmt    Current Prepared_statement
++  @param exe_join    Current JOIN
++  @param exe_path    Current AccessPath
++  @note
++    1. Currently, only limited single-table plan cache is supported.
++    2. Mainly do a few things:
++      1) stmt_join_store to cache JOIN
++      2) stmt_store_access_path to cache AccessPath
++      3) Create Plan_cache_entry and insert it into Plan cache
++*/
++void stmt_store_execute_context(Prepared_statement *exe_stmt, JOIN *exe_join,
++                                AccessPath *exe_path) {
++  if (exe_stmt == nullptr || exe_join == nullptr || exe_path == nullptr) return;
++
++  if (Plan_cache_singleton::getInstance().exist(exe_stmt->digest_hash)) return;
++
++  /**1. store join context */
++  JoinContext *join_context = new JoinContext();
++  assert(join_context);
++
++  stmt_join_store(join_context, exe_join);
++
++  /**2. store access path */
++  AccessPath *cache_path = new AccessPath();
++  assert(cache_path);
++
++  std::list<LEX_STRING> table_keys;
++  bool error = false;
++  /**3. get table_keys info */
++  stmt_store_access_path(cache_path, exe_join, exe_path, error,table_keys);
++  if (error) {
++    delete cache_path;
++    delete join_context;
++    return;
++  }
++
++  Plan_cache_entry *plan_cache_entry = new Plan_cache_entry(join_context, cache_path, table_keys);
++  assert(plan_cache_entry);
++
++  Plan_cache_singleton::getInstance().insert(exe_stmt->digest_hash, plan_cache_entry);
++
++  return;
++}
++
++/**
++  Restore the context of the from_path to to_path
++
++  @param thd_g[in]      Current THD
++  @param to_path[in/out] AccessPath currently executed
++  @param exe_join     JOIN currently executed
++  @param from_path    The assigned access_path is saved to the plan cache
++  @param error[in/out] If there is an unsupported type, error = true
++*/
++static void stmt_restore_access_path(THD *thd_g, AccessPath **to_path, JOIN *exe_join,
++                                     AccessPath *from_path, bool &error) {
++  assert(from_path != nullptr && *to_path == nullptr);
++  *to_path = new (exe_join->thd_g->mem_root) AccessPath;
++  (*to_path)->type = from_path->type;
++
++  Query_block *select = exe_join->query_block_g;
++  assert(select != nullptr);
++
++  Prepared_statement *exe_stmt = exe_join->thd_g->get_cur_exe_stmt();
++
++  switch (from_path->type) {
++    case AccessPath::REF: {
++      (*to_path)->ref().table = select->find_leaf_table_by_name(from_path->ref().table_ident)->table;
++      Index_lookup *exe_ref = new (exe_join->thd_g->mem_root) Index_lookup();
++      stmt_table_ref_restore(thd_g,exe_ref, exe_stmt, (*to_path)->ref().table,
++                             from_path->ref().ref);
++
++      (*to_path)->ref().ref = exe_ref;
++      (*to_path)->ref().use_order = from_path->ref().use_order;
++      (*to_path)->ref().reverse = from_path->ref().reverse;
++      break;
++    }
++    case AccessPath::FILTER: {
++      AccessPath *child = nullptr;
++      stmt_restore_access_path(thd_g, &child, exe_join, from_path->filter().child,
++                               error);
++
++      (*to_path)->filter().child = child;
++      (*to_path)->filter().condition = exe_join->where_cond;
++      (*to_path)->filter().materialize_subqueries =
++          from_path->filter().materialize_subqueries;
++      break;
++    }
++    case AccessPath::FAKE_SINGLE_ROW: {
++       {
++        Index_lookup *cached_ref = from_path->fake_single_row().ref;
++        Index_lookup *exe_ref = new (thd_g->mem_root) Index_lookup();
++        TABLE *exe_table = select->find_leaf_table_by_name(from_path->fake_single_row().table_ident)->table;
++        assert(exe_table != nullptr);
++        stmt_table_ref_restore(thd_g, exe_ref, exe_stmt, exe_table, cached_ref);
++        // This remains consistent with the original logic of mysql const table
++        read_const(exe_table, exe_ref);
++        exe_table->file->ha_index_or_rnd_end();
++      }
++      // The "const table" usage with "where" does not trigger a "filter
++      // accesspath", so a judgment is needed here
++      if (exe_join->where_cond != nullptr &&
++          !exe_join->where_cond->val_bool()) {
++        (*to_path)->type = AccessPath::ZERO_ROWS;
++      }
++      break;
++    }
++    default:
++      error = true;
++      return;
++  }
++  return;
++}
++
++
++/**
++  apply execution plan context from plan cache
++
++  @param exe_stmt    Current Prepared_statement
++  @param exe_join    Current JOIN
++  @param exe_path    Current AccessPath
++
++  @note
++  Currently, only limited single-table plan cache is supported.
++
++*/
++bool stmt_apply_execute_context(THD *thd_g, Prepared_statement *exe_stmt,JOIN *exe_join, AccessPath **exe_path) {
++  if (exe_stmt == nullptr || *exe_path != nullptr) 
++    return true;
++
++  Plan_cache_entry * plan_cache_entry = Plan_cache_singleton::getInstance().get(exe_stmt->digest_hash);
++  if (plan_cache_entry == nullptr)
++    return true;
++
++  //if apply failed, need to restore the original join context
++  JoinContext backup_join;
++  stmt_join_store(&backup_join, exe_join);
++
++  auto stmt_join_restore = [](JOIN* to_join, JoinContext* from_join) {
++    to_join->tables = from_join->tables;
++    to_join->const_tables = from_join->const_tables;
++    to_join->primary_tables = from_join->primary_tables;
++  };
++
++  stmt_join_restore(exe_join, plan_cache_entry->get_join());
++  AccessPath *cached_path = plan_cache_entry->get_access_path();
++  assert(cached_path != nullptr);
++
++  bool error = 0;
++
++  stmt_restore_access_path(thd_g, exe_path, exe_join, cached_path, error);
++  if (error) {
++    stmt_join_restore(exe_join, &backup_join);
++    return true;
++  }
++
++  plan_cache_total_use++;
++  exe_join->restore_in_plan_cache = true;
++  
++  return false;
++}
++#endif
+\ No newline at end of file
+diff --git a/sql/plan_cache.h b/sql/plan_cache.h
+new file mode 100644
+index 0000000..b228d10
+--- /dev/null
++++ b/sql/plan_cache.h
+@@ -0,0 +1,125 @@
++#include <string>
++
++#include "sql/join_optimizer/access_path.h"
++#include "sql/sql_optimizer.h"
++#include "sql/mysqld.h"
++
++class JOIN;
++struct AccessPath;
++class Prepared_statement;
++extern ulong plan_cache_map_size;
++extern ulong plan_cache_total_use;
++
++#ifdef HAVE_GAIA_PLAN_CACHE
++/*read lock*/
++class Plan_cache_rdlock {
++  mysql_rwlock_t *m_lock;
++
++ public:
++  Plan_cache_rdlock() {}
++  Plan_cache_rdlock(mysql_rwlock_t *lock) : m_lock(lock) {
++    mysql_rwlock_rdlock(m_lock);
++  }
++
++  ~Plan_cache_rdlock() { mysql_rwlock_unlock(m_lock); } //RAII
++};
++
++/*write lock*/
++class Plan_cache_wrlock {
++  mysql_rwlock_t *m_lock;
++
++ public:
++  Plan_cache_wrlock() {}
++  Plan_cache_wrlock(mysql_rwlock_t *lock) : m_lock(lock) {
++    mysql_rwlock_wrlock(m_lock);
++  }
++
++  ~Plan_cache_wrlock() { mysql_rwlock_unlock(m_lock); } //RAII
++};
++
++
++struct JoinContext {
++  uint tables{0};          // Total number of tables in query block
++  uint const_tables{0};    // Number of const tables
++  uint primary_tables{0};  // Number of primary input tables
++};
++
++/*support for plan cache to save join and accesspath from prepared statement*/
++class Plan_cache_entry {
++ private:
++  JoinContext *join_context;
++  AccessPath *access_path;
++  std::list<LEX_STRING> table_ids; // table id list
++
++ public:
++  Plan_cache_entry(JoinContext *join_ctx, AccessPath *path,
++                   std::list<LEX_STRING> &ids)
++      : join_context(join_ctx), access_path(path), table_ids(ids) {}
++
++  ~Plan_cache_entry() {
++    delete join_context;
++    delete access_path;
++    table_ids.clear();
++  }
++
++  JoinContext *get_join() { return join_context; }
++  AccessPath *get_access_path() { return access_path; }
++  std::list<LEX_STRING> &get_table_ids() { return table_ids; } //[db+table_name]
++};
++
++class Plan_cache_singleton {
++ private:
++  static Plan_cache_singleton *instance;      //singleton
++  mysql_rwlock_t m_lock;                      //plan cache lock
++
++  std::unordered_map<std::string, Plan_cache_entry *> m_plan_cache_map;   //digest_string_hash -> Plan_cache_entry
++  std::unordered_map<std::string, std::set<std::string>> m_table_cache_map; //[db+table_name] -> digest_string_hash
++
++ public:
++  static Plan_cache_singleton &getInstance() {
++    assert(instance != nullptr);
++
++    return *instance;
++  }
++
++  Plan_cache_singleton() = default;
++  ~Plan_cache_singleton() = default;
++
++  void initialize() {
++    mysql_rwlock_init(key_rwlock_LOCK_plan_cache, &m_lock);
++   instance = this;
++  }
++
++  void destroy() {
++    mysql_rwlock_destroy(&m_lock);
++    m_plan_cache_map.clear();
++    m_table_cache_map.clear();
++  }
++
++  Plan_cache_entry *get(const std::string &key);
++  bool exist(const std::string &key);
++  bool insert(const std::string &key, Plan_cache_entry *entry);
++  bool remove(const std::string &table_id);
++
++};
++
++/*
++  Store the context of the PrepareStatement statement optimizer in the plancache
++  @param exe_stmt    Current Prepared_statement
++  @param exe_join    Current JOIN
++  @param exe_path    Current AccessPath
++  @note Currently, only limited single-table plan cache is supported.
++*/
++void stmt_store_execute_context(Prepared_statement *exe_stmt, JOIN *exe_join, AccessPath *exe_path);
++
++/*
++  apply execution plan context from plan cache
++  @param exe_stmt    Current Prepared_statement
++  @param exe_join    Current JOIN
++  @param exe_path    Current AccessPath
++  @note Currently, only limited single-table plan cache is supported.
++*/
++bool stmt_apply_execute_context(THD *thd, Prepared_statement *exe_stmt,JOIN *exe_join, AccessPath **exe_path);
++
++bool use_plan_cache(THD *thd);
++#endif
+\ No newline at end of file
+diff --git a/sql/sql_base.cc b/sql/sql_base.cc
+index 2ce2f34..f52c3af 100644
+--- a/sql/sql_base.cc
++++ b/sql/sql_base.cc
+@@ -152,6 +152,9 @@
+ #include "sql_string.h"
+ #include "template_utils.h"
+ #include "thr_mutex.h"
++#ifdef HAVE_GAIA_PLAN_CACHE
++#include "sql/plan_cache.h"  // plan cache
++#endif
+ 
+ using std::equal_to;
+ using std::hash;
+@@ -7429,7 +7432,11 @@ bool open_temporary_table(THD *thd_g, TABLE_LIST *tl) {
+ 
+   table->reset();
+   table->init(thd_g, tl);
+-
++#ifdef HAVE_GAIA_PLAN_CACHE
++  // plan cache does not support temporary tables
++  if (use_plan_cache(thd_g))
++    thd_g->lex->plan_cache_type = enum_use_plan_cache_type::PC_NO_HINT;
++#endif
+   DBUG_PRINT("info", ("Using temporary table"));
+   return false;
+ }
+@@ -10285,6 +10292,16 @@ void tdc_remove_table(THD *thd_g, enum_tdc_remove_table_type remove_type,
+   auto remove_table = [&](Table_definition_cache::iterator my_it) {
+     if (my_it == table_def_cache->end()) return;
+     TABLE_SHARE *share = my_it->second.get();
++#ifdef HAVE_GAIA_PLAN_CACHE
++    /*When do DDL, drop table, truncate table, drop database, truncate database,
++     *,tdc_remove_table will be called to refresh TABLE_SHARE and TABLE.
++     * PLAN CACHE needs to add deletion logic here
++     */
++    if(use_plan_cache(thd_g)){
++      std::string table_key(share->table_cache_key.str, share->table_cache_key.length);
++      Plan_cache_singleton::getInstance().remove(table_key);
++    }
++#endif
+     /*
+       Since share->ref_count is incremented when a table share is opened
+       in get_table_share(), before LOCK_open is temporarily released, it
+diff --git a/sql/sql_class.cc b/sql/sql_class.cc
+index a24ec3a..aa33b3f 100644
+--- a/sql/sql_class.cc
++++ b/sql/sql_class.cc
+@@ -908,6 +908,9 @@ THD::THD(bool enable_plugins)
+ #ifndef NDEBUG
+   debug_binlog_xid_last.reset();
+ #endif
++#ifdef HAVE_GAIA_PLAN_CACHE
++  clear_cur_exe_stmt();
++#endif
+   set_system_user(false);
+   set_connection_admin(false);
+   m_mem_cnt.set_thd(this);
+@@ -1934,6 +1937,9 @@ void THD::cleanup_after_query() {
+     ctx->logout();
+   }
+   m_view_ctx_list.clear();
++#ifdef HAVE_GAIA_PLAN_CACHE
++  clear_cur_exe_stmt();
++#endif  
+   // Cleanup and free items that were created during this execution
+   cleanup_items(item_list());
+   free_items();
+diff --git a/sql/sql_class.h b/sql/sql_class.h
+index a991396..1096fe1 100644
+--- a/sql/sql_class.h
++++ b/sql/sql_class.h
+@@ -4706,6 +4706,13 @@ public:
+  public:
+   Transactional_ddl_context m_transactional_ddl{this};
+ 
++#ifdef HAVE_GAIA_PLAN_CACHE
++  Prepared_statement *m_cur_exe_stmt; // Current prepared statement
++public:
++  Prepared_statement *get_cur_exe_stmt() { return m_cur_exe_stmt; }
++  void set_cur_exe_stmt(Prepared_statement *stmt) { m_cur_exe_stmt = stmt; }
++  void clear_cur_exe_stmt() { m_cur_exe_stmt = nullptr; }
++#endif
+   /**
+     Flag to indicate this thread is executing
+     @ref sys_var::update for a @ref OPT_GLOBAL variable.
+diff --git a/sql/sql_digest.cc b/sql/sql_digest.cc
+index 8351345..c79914b 100644
+--- a/sql/sql_digest.cc
++++ b/sql/sql_digest.cc
+@@ -701,3 +701,25 @@ sql_digest_state *digest_reduce_token(sql_digest_state *state, uint token_left,
+ 
+   return state;
+ }
++
++#ifdef HAVE_GAIA_PLAN_CACHE
++/**
++* @brief Calculate the SHA256 hash value of the query string
++*
++* Calculate the hash value of the given query string using the SHA256 algorithm and store the result in hash_key.
++*
++* @param query_string Input query string
++* @param hash_key String used to store the calculated hash value
++ */
++void compute_query_digest_hash(std::string &query_string, std::string &hash_key) {
++  unsigned char sha256sum[SHA256_DIGEST_LENGTH];
++  (void)SHA_EVP256(pointer_cast<const unsigned char *>(query_string.data()),
++                   query_string.size(), sha256sum);
++
++  hash_key.reserve(DIGEST_HASH_TO_STRING_LENGTH);
++  hash_key.resize(DIGEST_HASH_TO_STRING_LENGTH);
++  
++  DIGEST_HASH_TO_STRING(sha256sum, hash_key.data());
++}
++#endif
++
+diff --git a/sql/sql_digest.h b/sql/sql_digest.h
+index 91b01ec..ef2d138 100644
+--- a/sql/sql_digest.h
++++ b/sql/sql_digest.h
+@@ -27,6 +27,9 @@
+ #include <sys/types.h>
+ 
+ #include "my_inttypes.h"  // IWYU pragma: keep
++#ifdef HAVE_GAIA_PLAN_CACHE
++#include <string>
++#endif
+ 
+ class String;
+ 
+@@ -181,4 +184,9 @@ void compute_digest_hash(const sql_digest_storage *digest_storage,
+ void compute_digest_text(const sql_digest_storage *digest_storage,
+                          String *digest_text);
+ 
++#ifdef HAVE_GAIA_PLAN_CACHE
++/*Calculate the SHA256 hash value of the query string*/
++void compute_query_digest_hash(std::string &query_string, std::string &hash_key);
++#endif
++
+ #endif
+diff --git a/sql/sql_hints.yy b/sql/sql_hints.yy
+index 52ac83f..e2e2637 100644
+--- a/sql/sql_hints.yy
++++ b/sql/sql_hints.yy
+@@ -134,6 +134,9 @@ static bool parse_int(longlong_typ *to, const char *from, size_t from_length)
+ %token PQ_HINT      1050
+ %token NO_PQ_HINT   1051
+ 
++//add by gaiadb as follows
++%token PLAN_CACHE_HINT 1060
++
+ /*
+   YYUNDEF in internal to Bison. Please don't change its number, or change
+   it in sync with YYUNDEF in sql_yacc.yy.
+@@ -422,6 +425,13 @@ qb_level_hint:
+             if ($$ == NULL)
+               YYABORT; // OOM
+           }
++          |
++          PLAN_CACHE_HINT
++          {
++            $$= NEW_PTN PT_qb_level_hint(NULL_CSTR, true, PLAN_CACHE_HINT_ENUM, 0);
++            if ($$ == NULL)
++              YYABORT; // OOM
++          }
+           | 
+           PQ_HINT
+           {
+diff --git a/sql/sql_lex.cc b/sql/sql_lex.cc
+index c287482..8096ac6 100644
+--- a/sql/sql_lex.cc
++++ b/sql/sql_lex.cc
+@@ -4767,6 +4767,27 @@ TABLE_LIST *Query_block::find_table_by_name(const Table_ident *ident) {
+   return nullptr;
+ }
+ 
++#ifdef HAVE_GAIA_PLAN_CACHE
++/*
++  Finds a (possibly unresolved) leaf table reference in the from clause by name.
++
++  @param ident The table name, may be qualified or unqualified.
++
++  @retval NULL If not found.
++*/
++Table_ref *Query_block::find_leaf_table_by_name(const Table_ident *ident) {
++  LEX_CSTRING db_name = ident->db;
++  LEX_CSTRING table_name = ident->table;
++
++  for (Table_ref *table = leaf_tables; table; table = table->next_leaf) {
++    if ((db_name.length == 0 || strcmp(db_name.str, table->db) == 0) &&
++        strcmp(table_name.str, table->alias) == 0)
++      return table;
++  }
++  return nullptr;
++}
++#endif
++
+ /**
+   Save prepared statement properties for a query block and underlying
+   query expressions. Required for repeated optimizations of the command.
+diff --git a/sql/sql_lex.h b/sql/sql_lex.h
+index 88d21bb..dfbfe5c 100644
+--- a/sql/sql_lex.h
++++ b/sql/sql_lex.h
+@@ -1275,7 +1275,9 @@ class Query_block : public Query_term {
+   Query_block *next_query_block() const { return next; }
+ 
+   TABLE_LIST *find_table_by_name(const Table_ident *ident);
+-
++#ifdef HAVE_GAIA_PLAN_CACHE
++  Table_ref *find_leaf_table_by_name(const Table_ident *ident);
++#endif
+   /**
+     @return true  If STRAIGHT_JOIN applies to all tables.
+     @return false Else.
+@@ -4259,7 +4261,9 @@ struct LEX : public Query_tables_list {
+     tree. When we get a pure parser this will not be needed.
+   */
+   bool will_contextualize;
+-
++#ifdef HAVE_GAIA_PLAN_CACHE
++  enum_use_plan_cache_type plan_cache_type{enum_use_plan_cache_type::PC_NO_HINT};
++#endif
+   LEX();
+ 
+   virtual ~LEX();
+diff --git a/sql/sql_lex_hints.cc b/sql/sql_lex_hints.cc
+index 2f55f14..720e801 100644
+--- a/sql/sql_lex_hints.cc
++++ b/sql/sql_lex_hints.cc
+@@ -228,6 +228,9 @@ void Hint_scanner::add_hint_token_digest() {
+           case NO_DERIVED_CONDITION_PUSHDOWN_HINT:
+           case PQ_HINT:
+           case NO_PQ_HINT:
++#ifdef HAVE_GAIA_PLAN_CACHE
++          case PLAN_CACHE_HINT:
++#endif          
+             break;
+           default:
+             assert(false);
+diff --git a/sql/sql_opt_exec_shared.h b/sql/sql_opt_exec_shared.h
+index 4b5430e..7364068 100644
+--- a/sql/sql_opt_exec_shared.h
++++ b/sql/sql_opt_exec_shared.h
+@@ -120,7 +120,15 @@ struct TABLE_REF {
+     being matched against individual fields in the associated KEY's key parts.
+    */
+   ulonglong_typ *keypart_hash = nullptr;
++#ifdef HAVE_GAIA_PLAN_CACHE
++  /*
++   Support for plan cache, mark the item pos for prepare-statement 
++   */
++  int *item_pos_in_query;
+ 
++  bool cache_impossible_null_ref{false}; // use plan cache
++  bool cache_value_impossible_null_ref; // use plan cache
++#endif
+   TABLE_REF()
+       : key_err(true),
+         key_parts(0),
+@@ -143,6 +151,9 @@ struct TABLE_REF {
+   */
+   bool impossible_null_ref() const {
+     if (null_rejecting == 0) return false;
++#ifdef HAVE_GAIA_PLAN_CACHE
++    if (cache_impossible_null_ref) return cache_value_impossible_null_ref;
++#endif    
+     for (uint i = 0; i < key_parts; i++) {
+       if ((null_rejecting & 1 << i) && items[i]->is_null()) {
+         return true;
+diff --git a/sql/sql_optimizer.cc b/sql/sql_optimizer.cc
+index ea6c139..86be715 100644
+--- a/sql/sql_optimizer.cc
++++ b/sql/sql_optimizer.cc
+@@ -113,6 +113,10 @@
+ #include "sql/pq_clone.h"
+ #include "sql/item_strfunc.h"
+ 
++#ifdef HAVE_GAIA_PLAN_CACHE
++#include "sql/plan_cache.h"
++#endif
++
+ using std::max;
+ using std::min;
+ 
+@@ -477,6 +481,15 @@ bool JOIN::optimize(bool finalize_access_paths) {
+ 
+   set_optimized();
+ 
++#ifdef HAVE_GAIA_PLAN_CACHE
++  if(use_plan_cache(thd_g) && thd_g->get_cur_exe_stmt()) {
++     if (!stmt_apply_execute_context(thd_g, thd_g->get_cur_exe_stmt(), this,
++                                      &m_root_access_path)) {
++      return false;
++    }
++  }
++#endif  
++
+   tables_list = query_block_g->leaf_tables;
+ 
+   if (alloc_indirection_slices()) return true;
+diff --git a/sql/sql_optimizer.h b/sql/sql_optimizer.h
+index 23ad9b4..85a17be 100644
+--- a/sql/sql_optimizer.h
++++ b/sql/sql_optimizer.h
+@@ -1076,6 +1076,10 @@ class JOIN {
+    */
+   AccessPath *m_root_access_path_no_in2exists = nullptr;
+ 
++#ifdef HAVE_GAIA_PLAN_CACHE
++public:
++  bool restore_in_plan_cache{false};    //for plan_cache
++#endif
+   /**
+   Convert the executor structures to a set of access paths, storing
+   the result in m_root_access_path.
+diff --git a/sql/sql_prepare.cc b/sql/sql_prepare.cc
+index 4e869c5..cb83a38 100644
+--- a/sql/sql_prepare.cc
++++ b/sql/sql_prepare.cc
+@@ -2546,6 +2546,15 @@ bool Prepared_statement::prepare(THD *thd_g, const char *query_str,
+   if (!error) {  // We've just created the statement maybe there is a rewrite
+     invoke_post_parse_rewrite_plugins(thd_g, true);
+     error = init_param_array(thd_g, this);
++#ifdef HAVE_GAIA_PLAN_CACHE
++    if(!error) {
++      std::string query_string(m_db.str, m_db.length);
++      query_string.append("###");
++      query_string.append(thd_g->query().str, thd_g->query().length);
++
++      compute_query_digest_hash(query_string, digest_hash);
++    }
++#endif
+   }
+   error |= thd_g->is_error();
+ 
+@@ -3634,6 +3643,10 @@ bool Prepared_statement::execute(THD *thd_g, String *expanded_query,
+       m_lex->binlog_need_explicit_defaults_ts;
+   resource_group_switched = mgr_ptr->switch_resource_group_if_needed(
+       thd_g, &src_res_grp, &dest_res_grp, &ticket, &cur_ticket);
++#ifdef HAVE_GAIA_PLAN_CACHE
++  //before executing the statement, we need to save the exec state
++  thd_g->set_cur_exe_stmt(this);
++#endif 
+ 
+   status = mysql_execute_command(thd_g, true);
+   if (status) return true;
+diff --git a/sql/sql_prepare.h b/sql/sql_prepare.h
+index 5dfd38b..9e1574e 100644
+--- a/sql/sql_prepare.h
++++ b/sql/sql_prepare.h
+@@ -376,6 +376,14 @@ class Prepared_statement final {
+   /// Performance Schema interface for a prepared statement.
+   PSI_prepared_stmt *m_prepared_stmt{nullptr};
+ 
++#ifdef HAVE_GAIA_PLAN_CACHE
++  /**
++    For the same query but different db, the results are different.
++    Compute by compute_digest_hash
++   */
++  std::string digest_hash;
++#endif
++
+  private:
+   /// True if statement is used with cursor, false if used in regular execution
+   bool m_used_as_cursor{false};
+diff --git a/sql/sql_union.cc b/sql/sql_union.cc
+index 44718bc..033a834 100644
+--- a/sql/sql_union.cc
++++ b/sql/sql_union.cc
+@@ -101,6 +101,9 @@
+ #include "sql/visible_fields.h"
+ #include "sql/window.h"  // Window
+ #include "template_utils.h"
++#ifdef HAVE_GAIA_PLAN_CACHE
++#include "sql/plan_cache.h"
++#endif
+ 
+ using std::move;
+ using std::vector;
+@@ -1427,6 +1430,11 @@ void Query_expression::create_access_paths(THD *thd_g) {
+     JOIN *join = first_query_block()->join;
+     assert(join && join->is_optimized());
+     m_root_access_path = join->root_access_path();
++#ifdef HAVE_GAIA_PLAN_CACHE
++    if(use_plan_cache(thd_g) && !join->restore_in_plan_cache && thd_g->get_cur_exe_stmt()) {
++      stmt_store_execute_context(thd_g->get_cur_exe_stmt(),join, m_root_access_path);
++    }
++#endif
+     return;
+   }
+ 
+diff --git a/sql/sys_vars.cc b/sql/sys_vars.cc
+index ff6ea05..825c337 100644
+--- a/sql/sys_vars.cc
++++ b/sql/sys_vars.cc
+@@ -5865,7 +5865,12 @@ static Sys_var_bit Sys_unique_checks("unique_checks", "unique_checks",
+                                      NO_CMD_LINE,
+                                      REVERSE(OPTION_RELAXED_UNIQUE_CHECKS),
+                                      DEFAULT(true), NO_MUTEX_GUARD, IN_BINLOG);
+-
++#ifdef HAVE_GAIA_PLAN_CACHE
++static Sys_var_bool Sys_enable_plan_cache(
++    "plan_cache_enable",
++    "Indicate whether to turn on the plan cache switch or not",
++    SESSION_VAR(plan_cache_enable), CMD_LINE(OPT_ARG), DEFAULT(false));
++#endif
+ #ifdef ENABLED_PROFILING
+ static Sys_var_bit Sys_profiling("profiling", "profiling",
+                                  SESSION_VAR(option_bits), NO_CMD_LINE,
+diff --git a/sql/system_variables.h b/sql/system_variables.h
+index 47d5811..0c6355c 100644
+--- a/sql/system_variables.h
++++ b/sql/system_variables.h
+@@ -524,6 +524,13 @@ struct System_variables {
+   
+   bool gaia_allow_read_dd_tables;
+   bool gaia_show_all_mdl_info;
++
++#ifdef HAVE_GAIA_PLAN_CACHE
++  /**
++    @sa Sys_plan_cache_enable
++  */
++  bool plan_cache_enable;
++#endif
+ };
+ 
+ /**

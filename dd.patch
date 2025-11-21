@@ -1,0 +1,1081 @@
+diff --git a/sql/create_field.cc b/sql/create_field.cc
+index a907a57..0dbd877 100644
+--- a/sql/create_field.cc
++++ b/sql/create_field.cc
+@@ -60,6 +60,7 @@ Create_field::Create_field(Field *old_field, Field *orig_field)
+       field_name(old_field->field_name),
+       change(nullptr),
+       comment(old_field->comment),
++      test(old_field->test),
+       sql_type(old_field->real_type()),
+       decimals(old_field->decimals()),
+       flags(old_field->all_flags()),
+@@ -194,7 +195,7 @@ bool Create_field::init(
+     THD *thd_g, const char *fld_name, enum_field_types fld_type,
+     const char *display_width_in_codepoints, const char *fld_decimals,
+     uint fld_type_modifier, Item *fld_default_value, Item *fld_on_update_value,
+-    const LEX_CSTRING *fld_comment, const char *fld_change,
++    const LEX_CSTRING *fld_comment, const LEX_CSTRING *fld_test, const char *fld_change,
+     List<String> *fld_interval_list, const CHARSET_INFO *fld_charset,
+     bool has_explicit_collation, uint fld_geom_type,
+     Value_generator *fld_gcol_info, Value_generator *fld_default_val_expr,
+@@ -262,6 +263,7 @@ bool Create_field::init(
+   interval_list.clear();
+ 
+   comment = *fld_comment;
++  test = *fld_test;
+ 
+   columnar_type =
+       gaia_get_columnar_type_by_comment(comment.str, comment.length);
+diff --git a/sql/create_field.h b/sql/create_field.h
+index 1a8fc11..6f5ffe9 100644
+--- a/sql/create_field.h
++++ b/sql/create_field.h
+@@ -98,6 +98,7 @@ class Create_field {
+   const char *change;
+   const char *after{nullptr};  // Put column after this one
+   LEX_CSTRING comment;         // Comment for field
++  LEX_CSTRING test;
+ 
+   /**
+      The declared default value, if any, otherwise NULL. Note that this member
+@@ -220,7 +221,7 @@ class Create_field {
+   bool init(THD *thd_g, const char *field_name, enum_field_types type,
+             const char *length, const char *decimals, uint type_modifier,
+             Item *default_value, Item *on_update_value,
+-            const LEX_CSTRING *comment, const char *change,
++            const LEX_CSTRING *comment, const LEX_CSTRING *test, const char *change,
+             List<String> *interval_list, const CHARSET_INFO *cs,
+             bool has_explicit_collation, uint uint_geom_type,
+             Value_generator *gcol_info, Value_generator *default_val_expr,
+diff --git a/sql/dd/dd_table.cc b/sql/dd/dd_table.cc
+index d722080..26bc5f3 100644
+--- a/sql/dd/dd_table.cc
++++ b/sql/dd/dd_table.cc
+@@ -637,6 +637,12 @@ bool fill_dd_columns_from_create_fields(THD *thd_g, dd::Abstract_table *tab_obj,
+       col_obj->set_comment(
+           dd::String_type(field.comment.str, field.comment.length));
+ 
++    //test
++    if(field.test.str && field.test.length) {
++      col_obj->set_test(
++          dd::String_type(field.test.str, field.test.length));
++    }
++
+     // Collation ID
+     col_obj->set_collation_id(field.charset->number);
+ 
+@@ -712,6 +718,10 @@ bool fill_dd_columns_from_create_fields(THD *thd_g, dd::Abstract_table *tab_obj,
+       col_options->set("is_array", true);
+     }
+ 
++    if(field.test.str && field.test.length) {
++      col_options->set("test", dd::String_type(field.test.str, field.test.length));
++    }
++
+     //
+     // Write intervals
+     //
+@@ -2150,6 +2160,12 @@ static bool fill_dd_table_from_create_info(
+   tab_obj->set_secondary_engine_attribute(
+       create_info->secondary_engine_attribute);
+ 
++  table_options->set("in_keep", create_info->m_inkeep);
++
++  dd::String_type keep_string;
++  keep_string.assign(table_name.c_str(), table_name.length());
++  table_options->set("keep_table_name", keep_string);
++
+   // TODO-MYSQL_VERSION: We decided not to store MYSQL_VERSION_ID ?
+   //
+   //       If we are to introduce this version we need to explain when
+diff --git a/sql/dd/impl/system_views/columns.cc b/sql/dd/impl/system_views/columns.cc
+index 5867ed6..9c84383 100644
+--- a/sql/dd/impl/system_views/columns.cc
++++ b/sql/dd/impl/system_views/columns.cc
+@@ -141,6 +141,8 @@ Columns::Columns() {
+   m_target_def.add_where(
+       "AND IS_VISIBLE_DD_OBJECT(tbl.hidden, col.hidden NOT IN ('Visible', "
+       "'User'), col.options)");
++  m_target_def.add_field(FIELD_COLUMN_TEST, "COLUMN_TEST",
++                         "IFNULL(col.test, '')");
+ }
+ 
+ }  // namespace system_views
+diff --git a/sql/dd/impl/system_views/columns.h b/sql/dd/impl/system_views/columns.h
+index b2607de..944efca 100644
+--- a/sql/dd/impl/system_views/columns.h
++++ b/sql/dd/impl/system_views/columns.h
+@@ -57,7 +57,8 @@ class Columns : public System_view_impl<System_view_select_definition_impl> {
+     FIELD_PRIVILEGES,
+     FIELD_COLUMN_COMMENT,
+     FIELD_GENERATION_EXPRESSION,
+-    FIELD_SRS_ID
++    FIELD_SRS_ID,
++    FIELD_COLUMN_TEST
+   };
+ 
+   Columns();
+diff --git a/sql/dd/impl/system_views/statistics.cc b/sql/dd/impl/system_views/statistics.cc
+index 5abfbcd..0e92814 100644
+--- a/sql/dd/impl/system_views/statistics.cc
++++ b/sql/dd/impl/system_views/statistics.cc
+@@ -85,6 +85,11 @@ Statistics_base::Statistics_base() {
+       FIELD_EXPRESSION, "EXPRESSION",
+       "IF (col.hidden = 'SQL', col.generation_expression_utf8, NULL)");
+ 
++  m_target_def.add_field(
++      FIELD_TEST, "TEST",
++       "IF (idx.type = 'PRIMARY' OR idx.type = 'UNIQUE', "
++      "    '',IF(INTERNAL_KEYS_DISABLED(tbl.options),'disabled', ''))");
++
+   m_target_def.add_from("mysql.index_column_usage icu");
+   m_target_def.add_from("JOIN mysql.indexes idx ON idx.id=icu.index_id");
+   m_target_def.add_from("JOIN mysql.tables tbl ON idx.table_id=tbl.id");
+diff --git a/sql/dd/impl/system_views/statistics.h b/sql/dd/impl/system_views/statistics.h
+index 11134b8..12a8b7a 100644
+--- a/sql/dd/impl/system_views/statistics.h
++++ b/sql/dd/impl/system_views/statistics.h
+@@ -53,6 +53,7 @@ class Statistics_base
+     FIELD_NULLABLE,
+     FIELD_INDEX_TYPE,
+     FIELD_COMMENT,
++    FIELD_TEST,
+     FIELD_INDEX_COMMENT,
+     FIELD_IS_VISIBLE,
+     FIELD_INDEX_ORDINAL_POSITION,
+diff --git a/sql/dd/impl/tables/columns.cc b/sql/dd/impl/tables/columns.cc
+index 72e6869..ca2109d 100644
+--- a/sql/dd/impl/tables/columns.cc
++++ b/sql/dd/impl/tables/columns.cc
+@@ -135,6 +135,8 @@ Columns::Columns() {
+   m_target_def.add_field(FIELD_SECONDARY_ENGINE_ATTRIBUTE,
+                          "FIELD_SECONDARY_ENGINE_ATTRIBUTE",
+                          "secondary_engine_attribute JSON");
++  m_target_def.add_field(FIELD_TEST, "FIELD_TEST",
++                         "test VARCHAR(2048) NOT NULL");
+ 
+   m_target_def.add_index(INDEX_PK_ID, "INDEX_PK_ID", "PRIMARY KEY(id)");
+   m_target_def.add_index(INDEX_UK_TABLE_ID_NAME, "INDEX_UK_TABLE_ID_NAME",
+diff --git a/sql/dd/impl/tables/columns.h b/sql/dd/impl/tables/columns.h
+index c7d3cf2..d5fd109 100644
+--- a/sql/dd/impl/tables/columns.h
++++ b/sql/dd/impl/tables/columns.h
+@@ -73,6 +73,7 @@ class Columns : public Object_table_impl {
+     FIELD_IS_EXPLICIT_COLLATION,
+     FIELD_ENGINE_ATTRIBUTE,
+     FIELD_SECONDARY_ENGINE_ATTRIBUTE,
++    FIELD_TEST,
+     NUMBER_OF_FIELDS  // Always keep this entry at the end of the enum
+   };
+ 
+diff --git a/sql/dd/impl/types/abstract_table_impl.cc b/sql/dd/impl/types/abstract_table_impl.cc
+index 1f55555..253ccc8 100644
+--- a/sql/dd/impl/types/abstract_table_impl.cc
++++ b/sql/dd/impl/types/abstract_table_impl.cc
+@@ -88,7 +88,9 @@ static const std::set<String_type> default_valid_option_keys = {
+     "tablespace",
+     "timestamp",
+     "view_valid",
+-    "gipk"};
++    "gipk"
++    ,"in_keep"
++    ,"keep_table_name"};
+ 
+ ///////////////////////////////////////////////////////////////////////////
+ // Abstract_table_impl implementation.
+diff --git a/sql/dd/impl/types/column_impl.cc b/sql/dd/impl/types/column_impl.cc
+index e1ee083..0b236d3 100644
+--- a/sql/dd/impl/types/column_impl.cc
++++ b/sql/dd/impl/types/column_impl.cc
+@@ -66,7 +66,7 @@ class Sdi_wcontext;
+ static const std::set<String_type> default_valid_option_keys = {
+     "column_format", "geom_type", "interval_count",
+     "not_secondary", "storage",   "treat_bit_as_char",
+-    "is_array",      "gipk" /* generated implicit primary key column */};
++    "is_array",      "gipk" /* generated implicit primary key column */, "test"};
+ 
+ ///////////////////////////////////////////////////////////////////////////
+ // Column_impl implementation.
+@@ -254,6 +254,8 @@ bool Column_impl::restore_attributes(const Raw_record &r) {
+ 
+   if (!r.is_null(Columns::FIELD_SRS_ID))
+     m_srs_id = r.read_uint(Columns::FIELD_SRS_ID);
++
++  m_test = r.read_str(Columns::FIELD_TEST); 
+   return false;
+ }
+ 
+@@ -327,11 +329,12 @@ bool Column_impl::store_attributes(Raw_record *r) {
+          r->store(Columns::FIELD_COLUMN_TYPE_UTF8, m_column_type_utf8) ||
+          r->store(Columns::FIELD_SRS_ID,
+                   (m_srs_id.has_value() ? m_srs_id.value() : 0),
+-                  !m_srs_id.has_value());
++                  !m_srs_id.has_value()) ||
++        r->store(Columns::FIELD_TEST, m_test);       
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////
+-static_assert(Columns::NUMBER_OF_FIELDS == 32,
++static_assert(Columns::NUMBER_OF_FIELDS == 33,
+               "Columns definition has changed, check if serialize() and "
+               "deserialize() need to be updated!!");
+ void Column_impl::serialize(Sdi_wcontext *wctx, Sdi_writer *w) const {
+@@ -380,7 +383,7 @@ void Column_impl::serialize(Sdi_wcontext *wctx, Sdi_writer *w) const {
+   serialize_each(wctx, w, m_elements, STRING_WITH_LEN("elements"));
+   write(w, m_collation_id, STRING_WITH_LEN("collation_id"));
+   write(w, m_is_explicit_collation, STRING_WITH_LEN("is_explicit_collation"));
+-
++  write(w, m_test, STRING_WITH_LEN("test"));
+   w->EndObject();
+ }
+ 
+@@ -434,7 +437,7 @@ bool Column_impl::deserialize(Sdi_rcontext *rctx, const RJ_Value &val) {
+ 
+   read(&m_collation_id, val, "collation_id");
+   read(&m_is_explicit_collation, val, "is_explicit_collation");
+-
++  read(&m_test, val, "test");
+   track_object(rctx, this);
+ 
+   return false;
+@@ -478,7 +481,8 @@ void Column_impl::debug_print(String_type &outb) const {
+      << "m_secondary_engine_attribute: " << m_secondary_engine_attribute << "; "
+      << "m_column_key: " << m_column_key << "; "
+      << "m_column_type_utf8: " << m_column_type_utf8 << "; "
+-     << "m_srs_id_null: " << !m_srs_id.has_value() << "; ";
++     << "m_srs_id_null: " << !m_srs_id.has_value() << "; "
++     << "m_test: " << m_test << "; ";
+ 
+   if (m_srs_id.has_value()) ss << "m_srs_id: " << m_srs_id.value() << "; ";
+ 
+@@ -545,6 +549,7 @@ Column_impl::Column_impl(const Column_impl &src, Abstract_table_impl *parent)
+       m_se_private_data(src.m_se_private_data),
+       m_engine_attribute(src.m_engine_attribute),
+       m_secondary_engine_attribute(src.m_secondary_engine_attribute),
++      m_test(src.m_test),
+       m_table(parent),
+       m_elements(),
+       m_column_type_utf8(src.m_column_type_utf8),
+diff --git a/sql/dd/impl/types/column_impl.h b/sql/dd/impl/types/column_impl.h
+index 59c0af3..ca5923e 100644
+--- a/sql/dd/impl/types/column_impl.h
++++ b/sql/dd/impl/types/column_impl.h
+@@ -405,6 +405,14 @@ class Column_impl : public Entity_object_impl, public Column {
+   }
+ 
+   /////////////////////////////////////////////////////////////////////////
++  // test.
++  /////////////////////////////////////////////////////////////////////////
++
++  const String_type &test() const override { return m_test; }
++
++  void set_test(const String_type &test) override { m_test = test; }
++  
++  /////////////////////////////////////////////////////////////////////////
+   // Column key type.
+   /////////////////////////////////////////////////////////////////////////
+ 
+@@ -535,6 +543,7 @@ class Column_impl : public Entity_object_impl, public Column {
+   // Se-specific json attributes
+   String_type m_engine_attribute;
+   String_type m_secondary_engine_attribute;
++  String_type m_test;
+ 
+   // References to tightly-coupled objects.
+ 
+diff --git a/sql/dd/impl/upgrade/dd.cc b/sql/dd/impl/upgrade/dd.cc
+index afdd5be..dd426a2 100644
+--- a/sql/dd/impl/upgrade/dd.cc
++++ b/sql/dd/impl/upgrade/dd.cc
+@@ -662,7 +662,7 @@ bool migrate_meta_data(THD *thd_g, const std::set<String_type> &create_set,
+   }
+   /********************* Migration of mysql.columns *********************/
+   /* Upgrade from 80020 or earlier. */
+-  static_assert(dd::tables::Columns::NUMBER_OF_FIELDS == 32,
++  static_assert(dd::tables::Columns::NUMBER_OF_FIELDS == 33,
+                 "SQL statements rely on a specific table definition");
+   if (is_dd_upgrade_from_before(bootstrap::DD_VERSION_80021)) {
+     /*
+diff --git a/sql/dd/types/column.h b/sql/dd/types/column.h
+index d30c4e7..a52feeb 100644
+--- a/sql/dd/types/column.h
++++ b/sql/dd/types/column.h
+@@ -289,6 +289,13 @@ class Column : virtual public Entity_object {
+   virtual void set_comment(const String_type &comment) = 0;
+ 
+   /////////////////////////////////////////////////////////////////////////
++  // test.
++  /////////////////////////////////////////////////////////////////////////
++
++  virtual const String_type &test() const = 0;
++  virtual void set_test(const String_type &test) = 0;
++
++  /////////////////////////////////////////////////////////////////////////
+   // hidden.
+   /////////////////////////////////////////////////////////////////////////
+ 
+diff --git a/sql/dd_table_share.cc b/sql/dd_table_share.cc
+index 70353b2..1269e44 100644
+--- a/sql/dd_table_share.cc
++++ b/sql/dd_table_share.cc
+@@ -639,6 +639,11 @@ static bool fill_share_from_dd(THD *thd_g, TABLE_SHARE *share,
+   }
+ 
+   share->db_options_in_use = share->db_create_options;
++  //keep table
++  if (table_options.exists("in_keep")) {
++    table_options.get("in_keep", &bool_opt);
++    share->m_inkeep = bool_opt;
++  }
+ 
+   // Average row length
+ 
+@@ -1084,6 +1089,26 @@ static bool fill_column_from_dd(THD *thd_g, TABLE_SHARE *share,
+     reg_field->comment.length = comment.length();
+   }
+ 
++  //yangjinyin todo : options
++  /*dd::String_type test = col_obj->test();
++  reg_field->test.length = test.length();
++  if (reg_field->test.length) {
++    reg_field->test.str =
++        strmake_root(&share->mem_root, test.c_str(), test.length());
++    reg_field->test.length = test.length();
++  }*/
++
++  dd::String_type test;
++  if (column_options->exists("test")) {
++    column_options->get("test", &test);
++    reg_field->test.length = test.length();
++    if (reg_field->test.length) {
++      reg_field->test.str =
++          strmake_root(&share->mem_root, test.c_str(), test.length());
++      reg_field->test.length = test.length();
++    }
++  }
++
+   // NOT SECONDARY column option.
+   if (column_options->exists("not_secondary"))
+     reg_field->set_flag(NOT_SECONDARY_FLAG);
+diff --git a/sql/field.cc b/sql/field.cc
+index 58049a5..c3a4c4b 100644
+--- a/sql/field.cc
++++ b/sql/field.cc
+@@ -1701,6 +1701,8 @@ Field::Field(uchar_t *ptr_arg, uint32 length_arg, uchar_t *null_ptr_arg,
+   comment.str = "";
+   comment.length = 0;
+   m_field_index = 0;
++  test.str = "";
++  test.length = 0;
+ }
+ 
+ /**
+diff --git a/sql/field.h b/sql/field.h
+index 134d317..f19b74f 100644
+--- a/sql/field.h
++++ b/sql/field.h
+@@ -686,6 +686,7 @@ class Field {
+   Item_sum *item_sum_ref{nullptr};
+   const char **table_name, *field_name;
+   LEX_CSTRING comment;
++  LEX_CSTRING test;
+   /* Field is part of the following keys */
+   Key_map key_start;          /* Keys that starts with this field */
+   Key_map part_of_key;        ///< Keys that includes this field
+diff --git a/sql/handler.cc b/sql/handler.cc
+index cc3827e..28fc624 100644
+--- a/sql/handler.cc
++++ b/sql/handler.cc
+@@ -2591,6 +2591,10 @@ void HA_CREATE_INFO::init_create_options_from_share(const TABLE_SHARE *share,
+ 
+   if (secondary_engine_attribute.str == nullptr)
+     secondary_engine_attribute = share->secondary_engine_attribute;
++
++  if (!(used_fields & HA_CREATE_USED_IN_KEEP)) {
++    m_inkeep = share->m_inkeep;
++  }
+ }
+ 
+ /****************************************************************************
+diff --git a/sql/handler.h b/sql/handler.h
+index e48c177..ea19987 100644
+--- a/sql/handler.h
++++ b/sql/handler.h
+@@ -809,6 +809,8 @@ constexpr const uint64_t HA_CREATE_USED_READ_ONLY{1ULL << 34};
+ */
+ constexpr const uint64_t HA_CREATE_USED_AUTOEXTEND_SIZE{1ULL << 35};
+ 
++constexpr const uint64_t HA_CREATE_USED_IN_KEEP{1L << 36};
++
+ /*
+   End of bits used in used_fields
+ */
+@@ -3116,6 +3118,7 @@ struct HA_CREATE_INFO {
+   */
+   bool m_hidden{false};
+ 
++  bool m_inkeep{false};
+   /*
+     A flag to indicate if this table should be created but not committed at
+     the end of statement.
+@@ -3391,6 +3394,9 @@ class Alter_inplace_info {
+   // Alter column visibility.
+   static const HA_ALTER_FLAGS ALTER_COLUMN_VISIBILITY = 1ULL << 49;
+ 
++  //Alter table to keep table
++  static const HA_ALTER_FLAGS ALTER_STORAGE_BUFFER_TYPE = 1ULL << 50;
++
+   /**
+     Create options (like MAX_ROWS) for the new version of table.
+ 
+diff --git a/sql/lex.h b/sql/lex.h
+index d7387c4..2b145cc 100644
+--- a/sql/lex.h
++++ b/sql/lex.h
+@@ -115,6 +115,7 @@ static const SYMBOL symbols[] = {
+     {SYM("BOTH", BOTH)},
+     {SYM("BTREE", BTREE_SYM)},
+     {SYM("BUCKETS", BUCKETS_SYM)},
++    {SYM("BUFFER_POOL", BUFFER_POOL_SYM)},
+     {SYM("BY", BY)},
+     {SYM("BYTE", BYTE_SYM)},
+     {SYM("CACHE", CACHE_SYM)},
+@@ -356,6 +357,7 @@ static const SYMBOL symbols[] = {
+     {SYM("JSON", JSON_SYM)},
+     {SYM("JSON_TABLE", JSON_TABLE_SYM)},
+     {SYM("JSON_VALUE", JSON_VALUE_SYM)},
++    {SYM("KEEP", KEEP_SYM)},
+     {SYM("KEY", KEY_SYM)},
+     {SYM("KEYRING", KEYRING_SYM)},
+     {SYM("KEYS", KEYS)},
+@@ -745,6 +747,7 @@ static const SYMBOL symbols[] = {
+     {SYM("TEMPORARY", TEMPORARY)},
+     {SYM("TEMPTABLE", TEMPTABLE_SYM)},
+     {SYM("TERMINATED", TERMINATED)},
++    {SYM("TEST_YJY", TEST_SYM)},
+     {SYM("TEXT", TEXT_SYM)},
+     {SYM("THAN", THAN_SYM)},
+     {SYM("THEN", THEN_SYM)},
+diff --git a/sql/parse_tree_column_attrs.h b/sql/parse_tree_column_attrs.h
+index 6c11c5b1..4219124 100644
+--- a/sql/parse_tree_column_attrs.h
++++ b/sql/parse_tree_column_attrs.h
+@@ -91,6 +91,7 @@ class PT_column_attr_base : public Parse_tree_node_tmpl<Column_parse_context> {
+   virtual void apply_type_flags(ulong_typ *) const {}
+   virtual void apply_alter_info_flags(ulonglong_typ *) const {}
+   virtual void apply_comment(LEX_CSTRING *) const {}
++  virtual void apply_test(LEX_CSTRING *) const {}
+   virtual void apply_default_value(Item **) const {}
+   virtual void apply_gen_default_value(Value_generator **) {}
+   virtual void apply_on_update_value(Item **) const {}
+@@ -274,6 +275,16 @@ class PT_comment_column_attr : public PT_column_attr_base {
+   void apply_comment(LEX_CSTRING *to) const override { *to = comment; }
+ };
+ 
++class PT_test_column_attr : public PT_column_attr_base {
++  const LEX_CSTRING test;
++
++ public:
++  explicit PT_test_column_attr(const LEX_CSTRING &test)
++      : test(test) {}
++
++  void apply_test(LEX_CSTRING *to) const override { *to = test; }
++};
++
+ /**
+   Node for the @SQL{COLLATE @<collation@>} column attribute
+ 
+@@ -887,6 +898,7 @@ class PT_field_def_base : public Parse_tree_node {
+   List<String> *interval_list;
+   alter_info_flags_t alter_info_flags;
+   LEX_CSTRING comment;
++  LEX_CSTRING test;
+   Item *default_value;
+   Item *on_update_value;
+   Value_generator *gcol_info;
+@@ -903,6 +915,7 @@ class PT_field_def_base : public Parse_tree_node {
+       : has_explicit_collation(false),
+         alter_info_flags(0),
+         comment(EMPTY_CSTR),
++        test(EMPTY_CSTR),
+         default_value(nullptr),
+         on_update_value(nullptr),
+         gcol_info(nullptr),
+@@ -936,6 +949,7 @@ class PT_field_def_base : public Parse_tree_node {
+         attr->apply_type_flags(&type_flags);
+         attr->apply_alter_info_flags(&alter_info_flags);
+         attr->apply_comment(&comment);
++        attr->apply_test(&test);
+         attr->apply_default_value(&default_value);
+         attr->apply_gen_default_value(&default_val_info);
+         attr->apply_on_update_value(&on_update_value);
+diff --git a/sql/parse_tree_nodes.cc b/sql/parse_tree_nodes.cc
+index 3c24cd5..0969f23 100644
+--- a/sql/parse_tree_nodes.cc
++++ b/sql/parse_tree_nodes.cc
+@@ -2173,7 +2173,7 @@ bool PT_column_def::contextualize(Table_ddl_parse_context *pc) {
+   return pc->alter_info->add_field(
+       pc->thd_g, &field_ident, field_def->type, field_def->length, field_def->dec,
+       field_def->type_flags, field_def->default_value,
+-      field_def->on_update_value, &field_def->comment, nullptr,
++      field_def->on_update_value, &field_def->comment, &field_def->test, nullptr,
+       field_def->interval_list, field_def->charset,
+       field_def->has_explicit_collation, field_def->uint_geom_type,
+       field_def->gcol_info, field_def->default_val_info, opt_place,
+@@ -2930,6 +2930,30 @@ Sql_cmd *PT_show_warnings::make_cmd(THD *thd_g) {
+   return &m_sql_cmd;
+ }
+ 
++bool PT_create_in_keep_option::contextualize(Table_ddl_parse_context *pc) {
++  if (super::contextualize(pc)) {
++    return true;
++  }
++
++  pc->create_info->m_inkeep = m_keep;
++  pc->create_info->used_fields |= HA_CREATE_USED_IN_KEEP;
++
++  bool is_temp = pc->create_info->options & HA_LEX_CREATE_TMP_TABLE;
++
++  if (m_keep && is_temp) {
++   // my_error(ER_CANNOT_CREATE_KEEP_TMP_TABLE, MYF(0));
++    return true;
++  }
++
++  if (m_keep && (pc->create_info->db_type != innodb_hton &&
++                 pc->create_info->db_type != nullptr)) {
++    //my_error(ER_INVALID_ENGINE_KEEP_TABLE, MYF(0));
++    return true;
++  }
++
++  return false;
++}
++
+ bool PT_alter_table_change_column::contextualize(Table_ddl_parse_context *pc) {
+   // Since Alter_info objects are allocated on a mem_root and never
+   // destroyed we (move)-assign an empty vector to cf_appliers to
+@@ -2950,7 +2974,7 @@ bool PT_alter_table_change_column::contextualize(Table_ddl_parse_context *pc) {
+   return pc->alter_info->add_field(
+       pc->thd_g, &m_new_name, m_field_def->type, m_field_def->length,
+       m_field_def->dec, m_field_def->type_flags, m_field_def->default_value,
+-      m_field_def->on_update_value, &m_field_def->comment, m_old_name.str,
++      m_field_def->on_update_value, &m_field_def->comment, &m_field_def->test, m_old_name.str,
+       m_field_def->interval_list, m_field_def->charset,
+       m_field_def->has_explicit_collation, m_field_def->uint_geom_type,
+       m_field_def->gcol_info, m_field_def->default_val_info, m_opt_place,
+@@ -3459,6 +3483,7 @@ bool PT_json_table_column_with_path::contextualize(Parse_context *pc) {
+                  nullptr,                       // Default value
+                  nullptr,                       // On update value
+                  &EMPTY_CSTR,                   // Comment
++                 &EMPTY_CSTR,                   // Test
+                  nullptr,                       // Change
+                  m_type->get_interval_list(),   // Interval list
+                  cs,                            // Charset & collation
+diff --git a/sql/parse_tree_nodes.h b/sql/parse_tree_nodes.h
+index 76addeb..78eb6c1 100644
+--- a/sql/parse_tree_nodes.h
++++ b/sql/parse_tree_nodes.h
+@@ -2627,6 +2627,20 @@ class PT_create_table_engine_option : public PT_create_table_option {
+   bool contextualize(Table_ddl_parse_context *pc) override;
+ };
+ 
++class PT_create_in_keep_option : public PT_create_table_option {
++  typedef PT_create_table_option super;
++
++  const bool m_keep;
++
++public:
++  /**
++    @param keep      Whether to keep table
++  */
++  explicit PT_create_in_keep_option(const bool in_keep) : m_keep(in_keep) {}
++
++  bool contextualize(Table_ddl_parse_context *pc) override;
++};
++
+ /**
+   Node for the @SQL{SECONDARY_ENGINE [=] @B{@<identifier@>|@<string@>|NULL}}
+   table option.
+diff --git a/sql/sql_alter.h b/sql/sql_alter.h
+index 47fe0db..9ff0639 100644
+--- a/sql/sql_alter.h
++++ b/sql/sql_alter.h
+@@ -491,7 +491,7 @@ class Alter_info {
+   bool add_field(THD *thd_g, const LEX_STRING *field_name,
+                  enum enum_field_types type, const char *length,
+                  const char *decimal, uint type_modifier, Item *default_value,
+-                 Item *on_update_value, LEX_CSTRING *comment,
++                 Item *on_update_value, LEX_CSTRING *comment, LEX_CSTRING *test,
+                  const char *change, List<String> *interval_list,
+                  const CHARSET_INFO *cs, bool has_explicit_collation,
+                  uint uint_geom_type, Value_generator *gcol_info,
+diff --git a/sql/sql_gipk.cc b/sql/sql_gipk.cc
+index 42a4a3d..e909ab6 100644
+--- a/sql/sql_gipk.cc
++++ b/sql/sql_gipk.cc
+@@ -160,7 +160,7 @@ static bool generate_invisible_primary_key(THD *thd_g, Alter_info *alter_info) {
+   if (cr_field->init(
+           thd_g, gipk_column_name, MYSQL_TYPE_LONGLONG, nullptr, nullptr,
+           (UNSIGNED_FLAG | NOT_NULL_FLAG | AUTO_INCREMENT_FLAG), nullptr,
+-          nullptr, &EMPTY_CSTR, nullptr, nullptr, nullptr, false, 0, nullptr,
++          nullptr, &EMPTY_CSTR, &EMPTY_CSTR, nullptr, nullptr, nullptr, false, 0, nullptr,
+           nullptr, {}, dd::Column::enum_hidden_type::HT_HIDDEN_USER, false))
+     return true;
+   if (alter_info->create_list.push_front(cr_field)) return true;
+diff --git a/sql/sql_parse.cc b/sql/sql_parse.cc
+index 2a70cdc..d7282fe 100644
+--- a/sql/sql_parse.cc
++++ b/sql/sql_parse.cc
+@@ -5773,7 +5773,7 @@ bool mysql_test_parse_for_slave(THD *thd_g) {
+ bool Alter_info::add_field(
+     THD *thd_g, const LEX_STRING *field_name, enum_field_types type,
+     const char *length, const char *decimals, uint type_modifier,
+-    Item *default_value, Item *on_update_value, LEX_CSTRING *comment,
++    Item *default_value, Item *on_update_value, LEX_CSTRING *comment, LEX_CSTRING *test,
+     const char *change, List<String> *interval_list, const CHARSET_INFO *cs,
+     bool has_explicit_collation, uint uint_geom_type,
+     Value_generator *gcol_info, Value_generator *default_val_expr,
+@@ -5877,7 +5877,7 @@ bool Alter_info::add_field(
+   Create_field *new_field = new (thd_g->mem_root) Create_field();
+   if ((new_field == nullptr) ||
+       new_field->init(thd_g, field_name->str, type, length, decimals,
+-                      type_modifier, default_value, on_update_value, comment,
++                      type_modifier, default_value, on_update_value, comment, test,
+                       change, interval_list, cs, has_explicit_collation,
+                       uint_geom_type, gcol_info, default_val_expr, srid, hidden,
+                       is_array))
+diff --git a/sql/sql_show.cc b/sql/sql_show.cc
+index 0b6470b..3be1b0a 100644
+--- a/sql/sql_show.cc
++++ b/sql/sql_show.cc
+@@ -2128,6 +2128,11 @@ bool store_create_info(THD *thd_g, TABLE_LIST *table_list, String *packet,
+       append_unescaped(packet, field->comment.str, field->comment.length);
+     }
+ 
++   if(field->test.length) {
++      packet->append(STRING_WITH_LEN(" TEST_YJY "));
++      append_unescaped(packet, field->test.str, field->test.length);
++    }
++
+     // Storage engine specific json attributes
+     if (field->m_engine_attribute.length) {
+       packet->append(STRING_WITH_LEN(" /*!80021 ENGINE_ATTRIBUTE '"));
+@@ -2423,6 +2428,9 @@ bool store_create_info(THD *thd_g, TABLE_LIST *table_list, String *packet,
+       packet->append(STRING_WITH_LEN(" CHECKSUM=1"));
+     if (share->db_create_options & HA_OPTION_DELAY_KEY_WRITE)
+       packet->append(STRING_WITH_LEN(" DELAY_KEY_WRITE=1"));
++    if (share->m_inkeep) {
++      packet->append(" STORAGE( KEEP )");
++    }
+ 
+     /*
+       If 'show_create_table_verbosity' is enabled, the row format would
+diff --git a/sql/sql_table.cc b/sql/sql_table.cc
+index de4ef77..b2b9516 100644
+--- a/sql/sql_table.cc
++++ b/sql/sql_table.cc
+@@ -12585,6 +12585,10 @@ static bool fill_alter_inplace_info(THD *thd_g, TABLE *table,
+     }
+   }
+ 
++  if ((ha_alter_info->create_info->used_fields & HA_CREATE_USED_IN_KEEP)) {
++    ha_alter_info->handler_flags |= Alter_inplace_info::ALTER_STORAGE_BUFFER_TYPE;
++  }
++  
+   return false;
+ }
+ 
+@@ -14134,7 +14138,7 @@ static bool upgrade_old_temporal_types(THD *thd_g, Alter_info *alter_info) {
+     if (!(temporal_field = new (thd_g->mem_root) Create_field()) ||
+         temporal_field->init(thd_g, def->field_name, sql_type, nullptr, nullptr,
+                              (def->flags & NOT_NULL_FLAG), default_value,
+-                             update_value, &def->comment, def->change, nullptr,
++                             update_value, &def->comment, &def->test, def->change, nullptr,
+                              nullptr, false, 0, nullptr, nullptr, def->m_srid,
+                              def->hidden, def->is_array))
+       return true;
+diff --git a/sql/sql_yacc.yy b/sql/sql_yacc.yy
+index 86dce47..43adf7d 100644
+--- a/sql/sql_yacc.yy
++++ b/sql/sql_yacc.yy
+@@ -1390,6 +1390,9 @@ void warn_about_deprecated_binary(THD *thd_g)
+ 
+ //gaiadb token as follows:
+ %token<lexer.keyword> REVERSE_WORDS_SYM 1208
++%token  KEEP_SYM 1210
++%token<lexer.keyword> BUFFER_POOL_SYM  1211
++%token<lexer.keyword> TEST_SYM 1212
+ 
+ /*
+   Precedence rules used to resolve the ambiguity when using keywords as idents
+@@ -1724,6 +1727,7 @@ void warn_about_deprecated_binary(THD *thd_g)
+         constraint_enforcement
+         opt_not
+         opt_interval
++        buffer_pool_opt
+ 
+ %type <show_cmd_type> opt_show_cmd_type
+ 
+@@ -4049,7 +4053,7 @@ sp_fdparam:
+             if (spvar->field_def.init(thd_g, "", field_type,
+                                       $2->get_length(), $2->get_dec(),
+                                       $2->get_type_flags(),
+-                                      NULL, NULL, &NULL_CSTR, 0,
++                                      NULL, NULL, &NULL_CSTR, &NULL_CSTR, 0,
+                                       $2->get_interval_list(),
+                                       cs ? cs : thd_g->variables.collation_database,
+                                       $3 != nullptr, $2->get_uint_geom_type(),
+@@ -4110,7 +4114,7 @@ sp_pdparam:
+             if (spvar->field_def.init(thd_g, "", field_type,
+                                       $3->get_length(), $3->get_dec(),
+                                       $3->get_type_flags(),
+-                                      NULL, NULL, &NULL_CSTR, 0,
++                                      NULL, NULL, &NULL_CSTR, &NULL_CSTR, 0,
+                                       $3->get_interval_list(),
+                                       cs ? cs : thd_g->variables.collation_database,
+                                       $4 != nullptr, $3->get_uint_geom_type(),
+@@ -4240,7 +4244,7 @@ sp_decl:
+               if (spvar->field_def.init(thd_g, "", var_type,
+                                         $3->get_length(), $3->get_dec(),
+                                         $3->get_type_flags(),
+-                                        NULL, NULL, &NULL_CSTR, 0,
++                                        NULL, NULL, &NULL_CSTR, &NULL_CSTR, 0,
+                                         $3->get_interval_list(),
+                                         cs ? cs : thd_g->variables.collation_database,
+                                         $4 != nullptr, $3->get_uint_geom_type(),
+@@ -6911,7 +6915,15 @@ create_table_option:
+           {
+             $$ = NEW_PTN PT_create_ts_autoextend_size_option($1);
+           }
++        | STORAGE_SYM '(' buffer_pool_opt ')'
++          {
++            $$ = NEW_PTN PT_create_in_keep_option($3);
++          }
+         ;
++buffer_pool_opt:
++      BUFFER_POOL_SYM KEEP_SYM { $$=true; }
++     | BUFFER_POOL_SYM DEFAULT_SYM { $$=false; }   
++     ;
+ 
+ ternary_option:
+           ulong_num
+@@ -7555,6 +7567,10 @@ column_attribute:
+           {
+             $$= NEW_PTN PT_comment_column_attr(to_lex_cstring($2));
+           }
++        | TEST_SYM TEXT_STRING_sys
++          {
++            $$= NEW_PTN PT_test_column_attr(to_lex_cstring($2));
++          }
+         | COLLATE_SYM collation_name
+           {
+             $$= NEW_PTN PT_collate_column_attr(@2, $2);
+@@ -17898,7 +17914,7 @@ sf_tail:
+ 
+             if (sp->m_return_field_def.init(YYTHD, "", field_type,
+                                             $10->get_length(), $10->get_dec(),
+-                                            $10->get_type_flags(), NULL, NULL, &NULL_CSTR, 0,
++                                            $10->get_type_flags(), NULL, NULL, &NULL_CSTR,  &NULL_CSTR, 0,
+                                             $10->get_interval_list(),
+                                             cs ? cs : YYTHD->variables.collation_database,
+                                             $11 != nullptr, $10->get_uint_geom_type(),
+diff --git a/sql/table.cc b/sql/table.cc
+index 3c4757e..ec1edb3 100644
+--- a/sql/table.cc
++++ b/sql/table.cc
+@@ -3506,6 +3506,7 @@ void update_create_info_from_table(HA_CREATE_INFO *create_info, TABLE *table) {
+   create_info->compress = share->compress;
+   create_info->encrypt_type = share->encrypt_type;
+   create_info->secondary_engine = share->secondary_engine;
++  create_info->m_inkeep = share->m_inkeep;
+ }
+ 
+ int rename_file_ext(const char *from, const char *to, const char *ext) {
+diff --git a/sql/table.h b/sql/table.h
+index 08c57c7..05bc6af 100644
+--- a/sql/table.h
++++ b/sql/table.h
+@@ -797,6 +797,7 @@ struct TABLE_SHARE {
+   ulong_typ stored_rec_length{0};       /* Stored record length
+                                     (no generated-only generated fields) */
+   ulonglong_typ autoextend_size{0};
++  bool m_inkeep{false};           /* keep table information */
+ 
+   plugin_ref db_plugin{nullptr};     /* storage engine plugin */
+   inline handlerton *db_type() const /* table_type for handler */
+diff --git a/storage/innobase/dict/dict0dd.cc b/storage/innobase/dict/dict0dd.cc
+index 08e2976..55e1c99 100644
+--- a/storage/innobase/dict/dict0dd.cc
++++ b/storage/innobase/dict/dict0dd.cc
+@@ -3756,6 +3756,12 @@ static inline dict_table_t *dd_fill_dict_table(const Table *dd_tab,
+   /* Set up the field in the newly allocated dict_table_t */
+   m_table->id = dd_tab->se_private_id();
+ 
++  bool opt = false;
++  if (dd_tab->table().options().exists("in_keep")) {
++    dd_tab->table().options().get("in_keep", &opt);
++  }
++  m_table->in_keep = opt;
++
+   if (dd_tab->se_private_data().exists(
+           dd_table_key_strings[DD_TABLE_DATA_DIRECTORY])) {
+     m_table->flags |= DICT_TF_MASK_DATA_DIR;
+@@ -5133,6 +5139,12 @@ dict_table_t *dd_open_table_one(dd::cache::Dictionary_client *client,
+     }
+   }
+ 
++  if (m_table->in_keep) {
++    register_keep_space_id(m_table->space);
++  } else {
++    unregister_keep_space_id(m_table->space);
++  }
++
+   m_table->acquire();
+ 
+   dict_sys_mutex_exit();
+diff --git a/storage/innobase/dict/dict0dict.cc b/storage/innobase/dict/dict0dict.cc
+index e138ba0..d0ee2c5 100644
+--- a/storage/innobase/dict/dict0dict.cc
++++ b/storage/innobase/dict/dict0dict.cc
+@@ -142,6 +142,8 @@ a DD table. Since the DD tables can be rebuilt with new SE private IDs,
+ this set replaces checks based on ranges of IDs. */
+ std::set<dd::Object_id> dict_sys_t::s_dd_table_ids = {};
+ 
++std::bitset<dict_sys_t::max_table_num+1> dict_sys_t::s_keep_space_ids = {0};
++
+ std::unordered_set<std::string> dict_sys_t::opened_partition_table_name = {};
+ 
+ /** The name of the data dictionary tablespace. */
+@@ -6212,6 +6214,44 @@ uint32_t dict_vcol_base_is_foreign_key(dict_v_col_t *vcol,
+   return foreign_col_count;
+ }
+ 
++static bool fsp_is_user_tablespace(space_id_t id) {
++  return !fsp_is_system_or_temp_tablespace(id) 
++         && !fsp_is_dd_tablespace(id) 
++         && !fsp_is_undo_tablespace(id);
++}
++
++/** Registers a user table to be kept in memory by marking it keep table.
++@param[in]  id  Space id of user table. */
++void register_keep_space_id(space_id_t id) {
++  ut_a(fsp_is_user_tablespace(id));
++
++  if (fsp_is_user_tablespace(id) && dict_sys != nullptr) {
++    dict_sys_t::register_keep_space_id(id);
++  }
++}
++
++/** Unregisters a user table to be kept in memory by marking it keep table.
++@param[in]  id  Space id of user table. */
++void unregister_keep_space_id(space_id_t id) {
++
++  if (fsp_is_user_tablespace(id) && dict_sys != nullptr) {
++    dict_sys_t::unregister_keep_space_id(id);
++  }
++}
++
++/** Checks if the given user table is marked as keep table , meaning its pages
++should be kept in memory.
++@param[in] id The space ID of user table to check.
++@return true if the space ID is marked as keep table. **/
++bool is_keep_space_id(space_id_t id) {
++
++  if (fsp_is_user_tablespace(id) && dict_sys != nullptr) {
++    return dict_sys_t::is_keep_space_id(id);
++  }
++  return false;
++}
++
++
+ #ifdef UNIV_DEBUG
+ /** Validate no active background threads to cause purge or rollback
+  operations. */
+diff --git a/storage/innobase/dict/mem.cc b/storage/innobase/dict/mem.cc
+index b6c573c..69c2a9e 100644
+--- a/storage/innobase/dict/mem.cc
++++ b/storage/innobase/dict/mem.cc
+@@ -268,6 +268,8 @@ dict_table_t *dict_mem_table_create(const char *name, space_id_t space,
+   table->is_dd_table = false;
+   table->explicitly_non_lru = false;
+ 
++  table->in_keep = false;
++
+   return (table);
+ }
+ 
+diff --git a/storage/innobase/fts/fts0fts.cc b/storage/innobase/fts/fts0fts.cc
+index e38afdf..b47ceea 100644
+--- a/storage/innobase/fts/fts0fts.cc
++++ b/storage/innobase/fts/fts0fts.cc
+@@ -1788,6 +1788,8 @@ static dict_table_t *fts_create_in_mem_aux_table(const char *aux_table_name,
+         mem_heap_strdup(new_table->heap, table->data_dir_path);
+   }
+ 
++  new_table->in_keep = table->in_keep;
++
+   return (new_table);
+ }
+ 
+diff --git a/storage/innobase/handler/ha_innodb.cc b/storage/innobase/handler/ha_innodb.cc
+index 5bdd2e8..583daa4 100644
+--- a/storage/innobase/handler/ha_innodb.cc
++++ b/storage/innobase/handler/ha_innodb.cc
+@@ -12211,6 +12211,9 @@ void innodb_base_col_setup_for_stored(const dict_table_t *table,
+ 
+           dict_sys_mutex_enter();
+           dict_table_add_to_cache(table, false);
++          if (table->in_keep) {
++            register_keep_space_id(table->space);
++          }
+           dict_sys_mutex_exit();
+         }
+ 
+@@ -14549,6 +14552,12 @@ int create_table_info_t::create_table_update_global_dd(Table *dd_table) {
+ 
+   dd_set_table_options(dd_table, m_table);
+ 
++  if (dd_table && dd_table->options().exists("in_keep")) {
++    bool opt;
++    dd_table->options().get("in_keep", &opt);
++    m_table->in_keep = opt;
++  }
++
+   dd_write_table(dd_space_id, dd_table, m_table);
+ 
+   if (m_flags2 & (DICT_TF2_FTS | DICT_TF2_FTS_ADD_DOC_ID)) {
+@@ -23072,6 +23081,11 @@ static MYSQL_SYSVAR_ULONG(
+     nullptr, 25, 1, 100, 0);
+ 
+ static MYSQL_SYSVAR_ULONG(
++    buffer_pool_keep_pct, srv_buf_pool_keep_pct, PLUGIN_VAR_RQCMDARG,
++    "Guarantees a minimum N% of the keep buffer pool is not evicted, default to 10", nullptr,
++    nullptr, 10, 0, 50, 0);
++
++static MYSQL_SYSVAR_ULONG(
+     idle_flush_pct, srv_idle_flush_pct, PLUGIN_VAR_RQCMDARG,
+     "Up to what percentage of dirty pages to be flushed when server is found"
+     " idle.",
+@@ -23963,6 +23977,7 @@ static SYS_VAR *innobase_system_variables[] = {
+     MYSQL_SYSVAR(buffer_pool_dump_at_shutdown),
+     MYSQL_SYSVAR(buffer_pool_in_core_file),
+     MYSQL_SYSVAR(buffer_pool_dump_pct),
++    MYSQL_SYSVAR(buffer_pool_keep_pct),
+ #ifdef UNIV_DEBUG
+     MYSQL_SYSVAR(buffer_pool_evict),
+ #endif /* UNIV_DEBUG */
+diff --git a/storage/innobase/include/dict0dict.h b/storage/innobase/include/dict0dict.h
+index da34c68..c027341 100644
+--- a/storage/innobase/include/dict0dict.h
++++ b/storage/innobase/include/dict0dict.h
+@@ -1096,6 +1096,36 @@ struct dict_sys_t {
+     return (s_dd_table_ids.find(id) != s_dd_table_ids.end());
+   }
+ 
++  /** Max number of space ids of keep tables (419,4303) */
++  static constexpr uint32_t max_table_num = 0x3FFFFF;
++  /** Set of space ids of keep tables */
++  static std::bitset<max_table_num+1> s_keep_space_ids;
++  /** Check if a tablespace id is a keep tablespace ID
++  @param[in]  space  tablespace id to check
++  @return true if a keep tablespace id, otherwise false */
++  static bool is_keep_space_id(space_id_t id) {
++    if (id > max_table_num) {
++      return false;
++    }
++    return s_keep_space_ids.test(id);
++  }
++  /** Add a spacespace id of keep table to cache
++  @param[in]  space  tablespace id of keep table*/
++  static void register_keep_space_id(space_id_t id) {
++    if (id > max_table_num) {
++      return;
++    }
++    s_keep_space_ids.set(id, true);
++  }
++  /** Remove a spacespace id of keep table to cache
++  @param[in]  space  tablespace id of keep table*/
++  static void unregister_keep_space_id(space_id_t id) {
++    if (id > max_table_num) {
++      return;
++    }
++    s_keep_space_ids.set(id, false);
++  }
++
+   /** The first ID of the redo log pseudo-tablespace */
+   static constexpr space_id_t s_log_space_id = 0xFFFFFFF0UL;
+ 
+@@ -1730,7 +1760,19 @@ bool dict_index_validate_max_rec_size(const dict_table_t *table,
+                                       const size_t page_rec_max,
+                                       const size_t page_ptr_max,
+                                       size_t &rec_max_size);
+-
++/** Checks if the given user table is marked as keep table , meaning its pages
++should be kept in memory.
++@param[in]  id      The space ID of user table to check.
++@return     true    if the space ID is marked as keep table.**/
++bool is_keep_space_id(space_id_t id);
++
++/** Registers a user table to be kept in memory by marking it keep table.
++@param[in]  id  Space id of user table. */
++void register_keep_space_id(space_id_t space_id);
++
++/** Unregisters a user table to be kept in memory by marking it keep table.
++@param[in]  id  Space id of user table. */
++void unregister_keep_space_id(space_id_t space_id);
+ #include "dict0dict.ic"
+ 
+ #endif
+diff --git a/storage/innobase/include/dict0mem.h b/storage/innobase/include/dict0mem.h
+index b9e1e86..05e6605 100644
+--- a/storage/innobase/include/dict0mem.h
++++ b/storage/innobase/include/dict0mem.h
+@@ -2438,6 +2438,8 @@ detect this and will eventually quit sooner. */
+   during table creation */
+   bool explicitly_non_lru;
+ 
++  bool in_keep;
++
+   /** @return the clustered index */
+   const dict_index_t *first_index() const {
+     ut_ad(magic_n == DICT_TABLE_MAGIC_N);
+diff --git a/storage/innobase/include/srv0srv.h b/storage/innobase/include/srv0srv.h
+index a07f083..9923e01 100644
+--- a/storage/innobase/include/srv0srv.h
++++ b/storage/innobase/include/srv0srv.h
+@@ -658,6 +658,8 @@ extern ulint srv_buf_pool_base_size;
+ extern long long srv_buf_pool_curr_size;
+ /** Dump this % of each buffer pool during BP dump */
+ extern ulong_typ srv_buf_pool_dump_pct;
++/** The N% of each buffer pool occupied by the keep list */
++extern ulong srv_buf_pool_keep_pct;
+ /** Lock table size in bytes */
+ extern ulint srv_lock_table_size;
+ 
+diff --git a/storage/innobase/row/row0mysql.cc b/storage/innobase/row/row0mysql.cc
+index 86160a3..2ebf914 100644
+--- a/storage/innobase/row/row0mysql.cc
++++ b/storage/innobase/row/row0mysql.cc
+@@ -2789,6 +2789,9 @@ dberr_t row_create_table_for_mysql(dict_table_t *&table,
+ 
+   dict_sys_mutex_enter();
+   dict_table_add_to_cache(table, false);
++  if (table->in_keep) {
++    register_keep_space_id(table->space);
++  }
+   dict_sys_mutex_exit();
+ 
+   /* During upgrade, etc., the log_ddl may haven't been
+diff --git a/storage/innobase/srv/srv0srv.cc b/storage/innobase/srv/srv0srv.cc
+index 5ac1de0..deff7de 100644
+--- a/storage/innobase/srv/srv0srv.cc
++++ b/storage/innobase/srv/srv0srv.cc
+@@ -486,6 +486,8 @@ ulint srv_buf_pool_base_size = 0;
+ long long srv_buf_pool_curr_size = 0;
+ /** Dump this % of each buffer pool during BP dump */
+ ulong_typ srv_buf_pool_dump_pct;
++/** The N% of each buffer pool occupied by the keep list */
++ulong srv_buf_pool_keep_pct;
+ /** Lock table size in bytes */
+ ulint srv_lock_table_size = ULINT_MAX;
+ 
