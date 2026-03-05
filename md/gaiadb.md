@@ -4,7 +4,11 @@
 
 ​     select * from performance_schema.data_locks\G;
 
+SELECT * FROM performance_schema.data_lock_waits\G;
+
 ​     select * from information_schema.innodb_trx;
+
+ SELECT * FROM sys.`innodb_lock_waits` \G
 
 ​     SHOW PROFILES ;
 
@@ -51,6 +55,10 @@ show binlog events in 'binlog.000001';
 SHOW ENGINE INNODB STATUS;
 
 SHOW VARIABLES LIKE 'optimizer_switch';
+
+
+
+select * from INFORMATION_SCHEMA.INNODB_BUFFER_PAGE；//统计inndob的page信息
 
 
 
